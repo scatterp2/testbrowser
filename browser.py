@@ -1,575 +1,1091 @@
 #!/usr/bin/env python3
 """
-jsbrowser.py - lightweight JS-capable terminal browser
-deps: curl, qjs (auto-downloaded), unzip, python3
-
-usage:
-  python3 jsbrowser.py [url]
-  python3 jsbrowser.py --dump <url>   # non-interactive, just print page
+jbrowser - A terminal-based browser with JavaScript execution support
+Uses Node.js with jsdom for full DOM and V8 JavaScript engine support
 """
-
-import sys
-import os
+import requests
+from bs4 import BeautifulSoup
 import re
 import json
-import html
 import subprocess
-import shutil
 import tempfile
-import urllib.parse
-from html.parser import HTMLParser
-from pathlib import Path
-
-# ─── config ───────────────────────────────────────────────────────────────────
-HOME       = Path.home()
-BASE_DIR   = HOME / ".jsbrowser"
-BIN_DIR    = BASE_DIR / "bin"
-WORK_DIR   = BASE_DIR / "tmp"
-COOKIE_JAR = BASE_DIR / "cookies.txt"
-HISTORY    = BASE_DIR / "history.txt"
-QJS        = BIN_DIR  / "qjs"
-UA         = "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0"
-QJS_URL    = "https://bellard.org/quickjs/binary_releases/quickjs-linux-i686-2024-01-13.zip"
-
-for d in (BASE_DIR, BIN_DIR, WORK_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-COOKIE_JAR.touch()
-HISTORY.touch()
-
-# ─── bootstrap qjs ────────────────────────────────────────────────────────────
-def bootstrap_qjs():
-    if QJS.exists() and os.access(QJS, os.X_OK):
-        return
-    print("[*] downloading qjs i686...")
-    zip_path = WORK_DIR / "qjs.zip"
-    subprocess.run(["curl", "-sL", QJS_URL, "-o", str(zip_path)], check=True)
-    extract = WORK_DIR / "qjs_extract"
-    extract.mkdir(exist_ok=True)
-    subprocess.run(["unzip", "-o", str(zip_path), "-d", str(extract)], check=True)
-    # find the qjs binary inside the extracted dir
-    found = list(extract.rglob("qjs"))
-    if not found:
-        print("[!] qjs binary not found in zip")
-        sys.exit(1)
-    shutil.copy(str(found[0]), str(QJS))
-    QJS.chmod(0o755)
-    print(f"[*] qjs ready: {QJS}")
-
-# ─── html renderer ────────────────────────────────────────────────────────────
-class PageParser(HTMLParser):
-    """parse HTML into text, links, forms, and script blocks"""
-
-    SKIP   = {"script", "style", "noscript", "svg", "iframe"}
-    BLOCK  = {"p","div","h1","h2","h3","h4","h5","h6","li","tr",
-               "br","section","article","header","footer","nav",
-               "main","aside","blockquote","pre","form","table",
-               "thead","tbody","tfoot","fieldset","legend","title"}
-    SPACER = {"td","th"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.text    = []        # rendered text chunks
-        self.links   = []        # [(num, text, href)]
-        self.forms   = []        # [{action,method,fields:[{name,type,value,id}]}]
-        self.scripts = []        # [src_string]
-        self.title   = ""
-
-        self._skip_depth   = 0
-        self._script_buf   = []
-        self._in_script    = False
-        self._link         = None   # (num, href)
-        self._link_buf     = []
-        self._form         = None
-        self._link_counter = 0
-        self._last_block   = True
-
-    def _attrs(self, attrs):
-        return dict(attrs)
-
-    def handle_starttag(self, tag, attrs):
-        a = self._attrs(attrs)
-
-        if self._skip_depth > 0:
-            self._skip_depth += 1
-            return
-
-        if tag in self.SKIP:
-            self._skip_depth += 1
-            if tag == "script" and not a.get("src"):
-                self._in_script = True
-                self._script_buf = []
-            return
-
-        if tag == "title":
-            self._in_script = True
-            self._script_buf = []
-            return
-
-        # meta refresh
-        if tag == "meta":
-            he = a.get("http-equiv","").lower()
-            if he == "refresh":
-                m = re.search(r"url=([^\s;]+)", a.get("content",""), re.I)
-                if m:
-                    self._meta_refresh = m.group(1).strip("\"'")
-
-        # links
-        if tag == "a":
-            href = a.get("href","")
-            if href and not href.startswith("#") and not href.startswith("javascript:"):
-                self._link_counter += 1
-                self._link = (self._link_counter, href)
-                self._link_buf = []
-
-        # forms
-        if tag == "form":
-            self._form = {
-                "action": a.get("action",""),
-                "method": a.get("method","GET").upper(),
-                "id":     a.get("id",""),
-                "fields": []
-            }
-
-        # form fields
-        if tag in ("input","textarea","select") and self._form is not None:
-            self._form["fields"].append({
-                "name":  a.get("name",""),
-                "type":  a.get("type","text"),
-                "value": a.get("value",""),
-                "id":    a.get("id",""),
-            })
-
-        # block spacing
-        if tag in self.BLOCK:
-            if not self._last_block:
-                self.text.append("\n")
-            self._last_block = True
-
-        if tag == "br":
-            self.text.append("\n")
-            self._last_block = True
-
-        if tag in self.SPACER:
-            self.text.append("  ")
-
-        # headings
-        if tag in ("h1","h2","h3"):
-            self.text.append("\n")
-
-    def handle_endtag(self, tag):
-        if self._skip_depth > 0:
-            self._skip_depth -= 1
-            if self._skip_depth == 0 and self._in_script:
-                src = "".join(self._script_buf).strip()
-                if src:
-                    self.scripts.append(src)
-                self._in_script = False
-                self._script_buf = []
-            return
-
-        if tag == "title":
-            self.title = "".join(self._script_buf).strip()
-            self._in_script = False
-            self._script_buf = []
-            return
-
-        if tag == "a" and self._link:
-            text = "".join(self._link_buf).strip()
-            num, href = self._link
-            if text:
-                self.links.append((num, text, href))
-                self.text.append(f" [{num}]")
-            self._link = None
-            self._link_buf = []
-
-        if tag == "form" and self._form is not None:
-            self.forms.append(self._form)
-            self._form = None
-
-        if tag in self.BLOCK:
-            self.text.append("\n")
-            self._last_block = True
-
-    def handle_data(self, data):
-        if self._skip_depth > 0:
-            if self._in_script:
-                self._script_buf.append(data)
-            return
-        if self._in_script:
-            self._script_buf.append(data)
-            return
-        if self._link is not None:
-            self._link_buf.append(data)
-        text = data
-        if text.strip():
-            self.text.append(text)
-            self._last_block = False
-
-    def render(self):
-        out = "".join(self.text)
-        # collapse 3+ newlines to 2
-        out = re.sub(r"\n{3,}", "\n\n", out)
-        return out.strip()
-
-
-def parse_page(html_src):
-    p = PageParser()
-    p._meta_refresh = None
-    try:
-        p.feed(html_src)
-    except Exception:
-        pass
-    return p
-
-
-# ─── url helpers ──────────────────────────────────────────────────────────────
-def resolve_url(base, url):
-    """resolve url relative to base"""
-    if not url:
-        return base
-    if url.startswith("http"):
-        return url
-    return urllib.parse.urljoin(base, url)
-
-
-def url_origin(url):
-    p = urllib.parse.urlparse(url)
-    return f"{p.scheme}://{p.netloc}"
-
-
-# ─── curl wrapper ─────────────────────────────────────────────────────────────
+import os
+from urllib.parse import urljoin, urlparse, parse_qs
 class Browser:
     def __init__(self):
-        self.current_url  = ""
-        self.current_html = ""
-        self.current_page = None   # PageParser
-        self.js_ctx       = {}
-        self.history_list = []
-        self._forms_filled = {}    # field overrides for next submit
-
-    def fetch(self, url, method="GET", data=None, extra_headers=None):
-        """fetch url with curl, return html string"""
-        cmd = [
-            "curl", "-sL",
-            "-A", UA,
-            "-b", str(COOKIE_JAR),
-            "-c", str(COOKIE_JAR),
-            "-D", str(WORK_DIR / "last_headers.txt"),
-            "--compressed",
-            "-o", str(WORK_DIR / "last_page.html"),
-        ]
-        if method == "POST" and data:
-            cmd += ["-X", "POST", "--data", data]
-        if extra_headers:
-            for h in extra_headers:
-                cmd += ["-H", h]
-        cmd.append(url)
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[!] curl error: {result.stderr.strip()}")
-            return ""
-
-        html_src = (WORK_DIR / "last_page.html").read_text(errors="replace")
-
-        # log history
-        with open(HISTORY, "a") as f:
-            f.write(url + "\n")
-        self.history_list.append(url)
-        self.current_url  = url
-        self.current_html = html_src
-        return html_src
-
-    def run_js(self, html_src, url):
-        """run inline scripts from page through qjs with fake DOM, return context dict"""
-        if not QJS.exists():
-            return {}
-
-        # write page and url for dom.js to pick up
-        (WORK_DIR / "last_page.html").write_text(html_src)
-
-        dom_js = Path(__file__).parent / "dom.js"
-        if not dom_js.exists():
-            return {}
-
-        env = os.environ.copy()
-        env["JSBROWSER_WORK_DIR"]    = str(WORK_DIR)
-        env["JSBROWSER_CURRENT_URL"] = url
-
-        result = subprocess.run(
-            [str(QJS), "--std", str(dom_js)],
-            capture_output=True, text=True, env=env, timeout=5
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return {}
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+        })
+        self.current_url = None
+        self.current_html = None
+        self.current_soup = None
+        self.wiz_data = {}
+        self.cookies = {}
+    def fetch(self, url):
+        """Fetch a URL and store the response"""
+        print(f"[*] Fetching: {url}")
         try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return {}
-
-    def load(self, url):
-        """fetch, run JS, handle redirects, render"""
-        url = resolve_url(self.current_url, url)
-        print(f"[*] → {url}")
-        html_src = self.fetch(url)
-        if not html_src:
-            return
-
-        page = parse_page(html_src)
-
-        # run inline JS
-        ctx = {}
-        try:
-            ctx = self.run_js(html_src, url)
+            response = self.session.get(url, allow_redirects=True)
+            response.raise_for_status()
+            self.current_url = response.url
+            self.current_html = response.text
+            self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
+            # Update cookies
+            self.cookies.update(self.session.cookies.get_dict())
+            print(f"[+] Successfully fetched: {self.current_url}")
+            return True
         except Exception as e:
-            pass
-        self.js_ctx = ctx
-
-        # follow JS/meta redirect if any
-        redirects = (ctx.get("js_redirects") or [])
-        if page._meta_refresh:
-            redirects.insert(0, page._meta_refresh)
-        if redirects:
-            rurl = resolve_url(url, redirects[0])
-            if rurl != url:
-                print(f"[*] redirect → {rurl}")
-                self.load(rurl)
-                return
-
-        self.current_page = page
-        self.current_url  = url
-        self._forms_filled = {}
-        self._render(page, url, ctx)
-
-    def _render(self, page, url, ctx):
-        """print the page to terminal"""
-        title = ctx.get("title") or page.title or "(no title)"
-        print()
-        print("━" * 60)
-        print(f"  {title}")
-        print(f"  {url}")
-        print("━" * 60)
-        print(page.render())
-
-        if page.links:
-            print()
-            print("── links " + "─" * 52)
-            for num, text, href in page.links[:40]:
-                resolved = resolve_url(url, href)
-                # truncate long text/urls
-                display = text[:50].replace("\n"," ").strip()
-                short   = resolved[:70]
-                print(f"  [{num:>3}] {display}")
-                print(f"         {short}")
-
-        if page.forms:
-            print()
-            print("── forms " + "─" * 52)
-            for i, form in enumerate(page.forms):
-                print(f"  form[{i}]: {form['method']} {form['action'] or '(current)'}")
-                visible = [f for f in form["fields"]
-                           if f["type"] not in ("hidden","submit")]
-                for field in visible:
-                    print(f"    {field['name'] or field['id']} ({field['type']})")
-
-        if ctx.get("js_errors"):
-            print()
-            print("── js errors " + "─" * 47)
-            for e in ctx["js_errors"][:5]:
-                print(f"  {e}")
-
-        print()
-
-    def submit(self, form_index=0, extra=None):
-        """submit a form, merging filled fields and hidden tokens"""
-        page = self.current_page
-        if not page or not page.forms:
-            print("[!] no forms on current page")
-            return
-
-        if form_index >= len(page.forms):
-            print(f"[!] no form[{form_index}]")
-            return
-
-        form   = page.forms[form_index]
-        action = resolve_url(self.current_url, form["action"] or self.current_url)
-        method = form["method"]
-
-        # build field dict: hidden tokens + user fills + extra
-        fields = {}
-        for f in form["fields"]:
-            if f["name"]:
-                fields[f["name"]] = f["value"]
-        # overlay JS-updated tokens
-        for k, v in (self.js_ctx.get("form_tokens") or {}).items():
-            fields[k] = v
-        # overlay user fills
-        fields.update(self._forms_filled)
-        if extra:
-            fields.update(extra)
-
-        data = urllib.parse.urlencode(fields)
-        print(f"[*] {method} {action}")
-
-        if method == "POST":
-            html_src = self.fetch(action, method="POST", data=data)
-        else:
-            sep = "&" if "?" in action else "?"
-            html_src = self.fetch(action + sep + data)
-
-        if html_src:
-            page = parse_page(html_src)
-            ctx  = {}
+            print(f"[-] Error fetching {url}: {e}")
+            return False
+    def execute_js(self, script):
+        """Execute JavaScript using Node.js with jsdom for full V8 + DOM support"""
+        if not self.current_html:
+            print("[-] No HTML content to execute JavaScript on")
+            return None
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as html_file:
+            html_file.write(self.current_html)
+            html_path = html_file.name
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as js_file:
+            js_file.write(script)
+            js_path = js_file.name
+        try:
+            # Run Node.js with jsdom
+            result = subprocess.run(
+                ['node', '/workspace/run_jsdom.js', html_path, js_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode != 0:
+                print(f"[-] JavaScript execution error: {result.stderr}")
+                return None
+            # Parse JSON output
             try:
-                ctx = self.run_js(html_src, self.current_url)
-            except Exception:
+                output = json.loads(result.stdout)
+                return output
+            except json.JSONDecodeError:
+                print(f"[-] Failed to parse JavaScript output: {result.stdout}")
+                return None
+        except subprocess.TimeoutExpired:
+            print("[-] JavaScript execution timed out")
+            return None
+        except Exception as e:
+            print(f"[-] Error executing JavaScript: {e}")
+            return None
+        finally:
+            # Cleanup temp files
+            try:
+                os.unlink(html_path)
+                os.unlink(js_path)
+            except:
                 pass
-            self.js_ctx      = ctx
-            self.current_page = page
-            self._forms_filled = {}
-            self._render(page, self.current_url, ctx)
-
-    def fill(self, name, value):
-        """fill a form field by name or id"""
-        self._forms_filled[name] = value
-        print(f"[*] filled {name} = {value!r}")
-
-    def back(self):
-        if len(self.history_list) >= 2:
-            self.history_list.pop()  # current
-            prev = self.history_list.pop()
-            self.load(prev)
-        else:
-            print("[!] no history")
-
-    def show_cookies(self):
-        print(COOKIE_JAR.read_text() or "(no cookies)")
-
-    def show_source(self):
-        print(self.current_html[:5000])
-
-    def show_headers(self):
-        h = WORK_DIR / "last_headers.txt"
-        print(h.read_text() if h.exists() else "(none)")
-
-    def show_js_ctx(self):
-        print(json.dumps(self.js_ctx, indent=2))
-
-    def show_forms(self):
-        if not self.current_page or not self.current_page.forms:
-            print("[!] no forms")
-            return
-        for i, form in enumerate(self.current_page.forms):
-            print(f"\nform[{i}]: {form['method']} {form['action']}")
-            for f in form["fields"]:
-                filled = self._forms_filled.get(f["name"], f["value"])
-                print(f"  {f['type']:10} {f['name'] or f['id']:30} = {filled!r}")
-
-
-# ─── repl ─────────────────────────────────────────────────────────────────────
-HELP = """
-commands:
-  <url>                  navigate to url
-  <number>               follow link by number
-  back / b               go back
-  fill <name> <value>    fill a form field
-  submit [n]             submit form (default form 0)
-  forms                  show all form fields
-  cookies                show cookie jar
-  source                 show page source (first 5k)
-  headers                show last response headers
-  js                     show JS execution context
-  reload                 reload current page
-  help                   this message
-  quit / q               exit
-"""
-
-def repl(browser, start_url):
-    browser.load(start_url)
-
-    while True:
+    def extract_wiz_data(self):
+        """Extract Google WIZ global data structures using JavaScript"""
+        script = """
+        const fs = require('fs');
+        const path = process.argv[2];
+        const html = fs.readFileSync(path, 'utf-8');
+        // Extract WIZ_global_data - try multiple patterns
+        let wizMatch = html.match(/window\\.WIZ_global_data\\s*=\\s*({[\\s\\S]*?});\\s*<\\/script>/);
+        if (!wizMatch) {
+            wizMatch = html.match(/window\\._WIZ_global_data\\s*=\\s*({[\\s\\S]*?});/);
+        }
+        if (!wizMatch) {
+            console.log(JSON.stringify({error: "No WIZ_global_data found", htmlSnippet: html.substring(0, 2000)}));
+            process.exit(0);
+        }
+        try {
+            let wizData = JSON.parse(wizMatch[1]);
+            // Extract tokens
+            const tokens = {};
+            const tokenNames = ['SNlM0e', 'TSDtV', 'FdrFJe', 'Qzxixc', 'dsh', 'TL', 'GxKqAd', 'k2rUvb', 'bgfDDd'];
+            for (const name of tokenNames) {
+                if (wizData[name]) {
+                    tokens[name] = wizData[name];
+                }
+            }
+            // Deep search for tokens in arrays
+            function findTokens(obj, depth = 0) {
+                if (depth > 10) return;
+                if (Array.isArray(obj)) {
+                    for (let i = 0; i < obj.length; i++) {
+                        if (typeof obj[i] === 'string' && obj[i].length > 10 && obj[i].length < 500) {
+                            if (!tokens.candidateToken) tokens.candidateToken = [];
+                            tokens.candidateToken.push(obj[i]);
+                        }
+                        findTokens(obj[i], depth + 1);
+                    }
+                } else if (typeof obj === 'object' && obj !== null) {
+                    for (const key in obj) {
+                        findTokens(obj[key], depth + 1);
+                    }
+                }
+            }
+            findTokens(wizData);
+            // Extract form action URLs
+            const actions = [];
+            function findActions(obj) {
+                if (Array.isArray(obj)) {
+                    for (let i = 0; i < obj.length; i++) {
+                        if (typeof obj[i] === 'string') {
+                            if (obj[i].includes('/signup/') || obj[i].includes('/lifecycle/')) {
+                                actions.push(obj[i]);
+                            }
+                        }
+                        findActions(obj[i]);
+                    }
+                }
+            }
+            findActions(wizData);
+            // Extract field definitions
+            const fields = [];
+            if (wizData.focusedModelId) {
+                fields.push({type: 'focusedModelId', value: wizData.focusedModelId});
+            }
+            console.log(JSON.stringify({
+                tokens: tokens,
+                actions: [...new Set(actions)],
+                fields: fields,
+                rawKeys: Object.keys(wizData)
+            }));
+        } catch (e) {
+            console.log(JSON.stringify({error: e.message}));
+        }
+        """
+        result = self.execute_js(script)
+        if result:
+            self.wiz_data = result
+            return result
+        return {}
+    def get_links(self):
+        """Extract all links from the current page"""
+        if not self.current_soup:
+            return []
+        links = []
+        for a in self.current_soup.find_all('a', href=True):
+            text = a.get_text(strip=True)
+            href = a['href']
+            links.append({'text': text, 'href': href})
+        return links
+    def get_forms(self):
+        """Extract form information including WIZ-driven forms"""
+        if not self.current_soup:
+            return []
+        forms = []
+        # Traditional forms
+        for form in self.current_soup.find_all('form'):
+            form_data = {
+                'action': form.get('action', ''),
+                'method': form.get('method', 'GET').upper(),
+                'inputs': []
+            }
+            for input_tag in form.find_all('input'):
+                input_data = {
+                    'name': input_tag.get('name'),
+                    'type': input_tag.get('type', 'text'),
+                    'value': input_tag.get('value', '')
+                }
+                form_data['inputs'].append(input_data)
+            forms.append(form_data)
+        # WIZ-driven forms (no explicit form tags)
+        if self.wiz_data.get('fields'):
+            wiz_form = {
+                'action': self.wiz_data.get('actions', [''])[0] if self.wiz_data.get('actions') else '',
+                'method': 'POST',
+                'inputs': [],
+                'wiz_driven': True,
+                'tokens': self.wiz_data.get('tokens', {})
+            }
+            # Detect common field patterns
+            input_names = ['firstName', 'lastName', 'username', 'password', 'email']
+            for name in input_names:
+                wiz_form['inputs'].append({
+                    'name': name,
+                    'type': 'text',
+                    'value': ''
+                })
+            forms.append(wiz_form)
+        return forms
+    def fill_form(self, form_index, data):
+        """Fill form fields with provided data"""
+        forms = self.get_forms()
+        if form_index >= len(forms):
+            print(f"[-] Form index {form_index} out of range")
+            return False
+        form = forms[form_index]
+        print(f"[*] Filling form with data: {data}")
+        # For WIZ-driven forms, we need to submit via JavaScript
+        if form.get('wiz_driven'):
+            # Store form data for submission
+            self.pending_form_data = data
+            self.pending_form = form
+            return True
+        # For traditional forms, update the soup
+        for input_name, value in data.items():
+            input_tag = self.current_soup.find('input', {'name': input_name})
+            if input_tag:
+                input_tag['value'] = value
+        return True
+    def submit_form(self, form_index=None):
+        """Submit a form, handling both traditional and WIZ-driven forms"""
+        forms = self.get_forms()
+        if form_index is None:
+            form_index = 0
+        if form_index >= len(forms):
+            print(f"[-] Form index {form_index} out of range")
+            return False
+        form = forms[form_index]
+        # Handle WIZ-driven form submission with JavaScript
+        if form.get('wiz_driven') or not form.get('action'):
+            return self.submit_wiz_form(form)
+        # Traditional form submission
+        action = form.get('action', '')
+        if not action.startswith('http'):
+            action = urljoin(self.current_url, action)
+        method = form.get('method', 'POST')
+        # Collect form data
+        form_data = {}
+        for input_field in form.get('inputs', []):
+            name = input_field.get('name')
+            value = input_field.get('value', '')
+            if name:
+                form_data[name] = value
+        # Add any pending form data
+        if hasattr(self, 'pending_form_data'):
+            form_data.update(self.pending_form_data)
+        print(f"[*] Submitting form to {action} with method {method}")
+        print(f"[*] Form data: {form_data}")
         try:
-            line = input(f"\n[{browser.current_url[:60]}]\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nbye")
-            break
-
-        if not line:
-            browser._render(browser.current_page, browser.current_url, browser.js_ctx)
-            continue
-
-        parts = line.split(None, 2)
-        cmd   = parts[0].lower()
-
-        if cmd in ("quit","exit","q"):
-            print("bye")
-            break
-        elif cmd in ("back","b"):
-            browser.back()
-        elif cmd == "reload":
-            browser.load(browser.current_url)
-        elif cmd == "cookies":
-            browser.show_cookies()
-        elif cmd == "source":
-            browser.show_source()
-        elif cmd == "headers":
-            browser.show_headers()
-        elif cmd == "js":
-            browser.show_js_ctx()
-        elif cmd == "forms":
-            browser.show_forms()
-        elif cmd == "help":
-            print(HELP)
-        elif cmd == "fill":
-            if len(parts) >= 3:
-                browser.fill(parts[1], parts[2])
-            elif len(parts) == 2:
-                val = input(f"  value for {parts[1]}: ")
-                browser.fill(parts[1], val)
+            if method.upper() == 'POST':
+                response = self.session.post(action, data=form_data, allow_redirects=True)
             else:
-                print("usage: fill <name> <value>")
-        elif cmd == "submit":
-            idx = int(parts[1]) if len(parts) > 1 else 0
-            browser.submit(idx)
-        elif re.match(r"^\d+$", cmd):
-            # follow numbered link
-            num = int(cmd)
-            if browser.current_page:
-                found = [(t,h) for n,t,h in browser.current_page.links if n == num]
-                if found:
-                    browser.load(found[0][1])
-                else:
-                    print(f"[!] link {num} not found")
-        elif cmd.startswith("http"):
-            browser.load(line)
-        else:
-            print(f"[?] unknown command: {cmd}")
-            print("type 'help' for commands")
-
-
-# ─── main ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    bootstrap_qjs()
-
-    args = sys.argv[1:]
-    dump_mode = "--dump" in args
-    if dump_mode:
-        args.remove("--dump")
-
-    start = args[0] if args else "https://example.com"
-
-    browser = Browser()
-
-    if dump_mode:
-        html_src = browser.fetch(start)
-        page     = parse_page(html_src)
-        ctx      = {}
+                response = self.session.get(action, params=form_data, allow_redirects=True)
+            response.raise_for_status()
+            self.current_url = response.url
+            self.current_html = response.text
+            self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
+            print(f"[+] Form submitted successfully, now at: {self.current_url}")
+            return True
+        except Exception as e:
+            print(f"[-] Form submission failed: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"[-] Response status: {e.response.status_code}")
+                print(f"[-] Response body (first 500 chars): {e.response.text[:500]}")
+            return False
+    def submit_wiz_form(self, form):
+        """Submit a WIZ-driven form using JavaScript"""
+        print("[*] Submitting WIZ-driven form...")
+        # Get form data
+        form_data = getattr(self, 'pending_form_data', {})
+        tokens = form.get('tokens', {})
+        # Build JavaScript for form submission
+        script = '''
+        const fs = require('fs');
+        const path = process.argv[2];
+        const html = fs.readFileSync(path, 'utf-8');
+        // Extract the actual submission endpoint from WIZ data
+        const wizMatch = html.match(/window\\._WIZ_global_data\\s*=\\s*({[\\s\\S]*?});/);
+        let submitUrl = "''' + self.current_url + '''";
+        let additionalParams = {};
+        if (wizMatch) {
+            try {
+                const wizData = JSON.parse(wizMatch[1]);
+                // Look for nextPageUrl or action URLs
+                if (wizData.nextPageUrl) {
+                    submitUrl = wizData.nextPageUrl;
+                }
+                // Search for RPC endpoints
+                function findRpcEndpoints(obj) {
+                    if (Array.isArray(obj)) {
+                        for (let item of obj) {
+                            if (typeof item === 'string' && item.includes('/signup/') && item.includes('/webname')) {
+                                submitUrl = 'https://accounts.google.com' + item;
+                            }
+                            findRpcEndpoints(item);
+                        }
+                    }
+                }
+                findRpcEndpoints(wizData);
+                // Extract additional required parameters
+                if (wizData.TL) additionalParams.TL = wizData.TL;
+                if (wizData.dsh) additionalParams.dsh = wizData.dsh;
+            } catch (e) {
+                console.error("Error parsing WIZ data:", e);
+            }
+        }
+        // Prepare the payload
+        const payload = {
+            url: submitUrl,
+            params: additionalParams,
+            formData: ''' + json.dumps(form_data) + ''',
+            tokens: ''' + json.dumps(tokens) + '''
+        };
+        console.log(JSON.stringify(payload));
+        '''
+        result = self.execute_js(script)
+        if not result:
+            print("[-] Failed to prepare WIZ form submission")
+            return False
+        submit_url = result.get('url', self.current_url)
+        additional_params = result.get('params', {})
+        form_payload = result.get('formData', {})
+        tokens = result.get('tokens', {})
+        # Merge all parameters
+        form_payload.update(additional_params)
+        form_payload.update(tokens)
+        print(f"[*] Submitting to: {submit_url}")
+        print(f"[*] Payload: {form_payload}")
         try:
-            ctx = browser.run_js(html_src, start)
-        except Exception:
-            pass
-        browser._render(page, start, ctx)
+            # Try different content types that Google might expect
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Same-Origin': '1',
+            }
+            response = self.session.post(
+                submit_url,
+                data=form_payload,
+                headers=headers,
+                allow_redirects=True
+            )
+            # Check if we got redirected to the next page
+            if response.status_code in [200, 302, 303]:
+                self.current_url = response.url
+                self.current_html = response.text
+                self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
+                print(f"[+] Submission successful, now at: {self.current_url}")
+                # Check if we reached the username page (page 3)
+                if 'username' in self.current_html.lower() or 'choose your username' in self.current_html.lower():
+                    print("[+] SUCCESS: Reached username selection page (Page 3)!")
+                return True
+            else:
+                print(f"[-] Unexpected status code: {response.status_code}")
+                print(f"[-] Response: {response.text[:500]}")
+                return False
+        except Exception as e:
+            print(f"[-] WIZ form submission failed: {e}")
+            return False
+    def click_link(self, text_or_index):
+        """Click a link by text or index"""
+        links = self.get_links()
+        target_link = None
+        if isinstance(text_or_index, int):
+            if text_or_index < len(links):
+                target_link = links[text_or_index]
+        else:
+            for link in links:
+                if text_or_index.lower() in link['text'].lower():
+                    target_link = link
+                    break
+        if not target_link:
+            print(f"[-] Link not found: {text_or_index}")
+            return False
+        href = target_link['href']
+        if not href.startswith('http'):
+            href = urljoin(self.current_url, href)
+        print(f"[*] Clicking link: {target_link['text']} -> {href}")
+        return self.fetch(href)
+    def click_button(self, text_or_index):
+        """Click a button by text or index"""
+        if not self.current_soup:
+            return False
+        buttons = self.current_soup.find_all('button')
+        inputs = self.current_soup.find_all('input', {'type': 'submit'})
+        all_buttons = buttons + inputs
+        target_button = None
+        if isinstance(text_or_index, int):
+            if text_or_index < len(all_buttons):
+                target_button = all_buttons[text_or_index]
+        else:
+            for button in all_buttons:
+                btn_text = button.get_text(strip=True) or button.get('value', '')
+                if text_or_index.lower() in btn_text.lower():
+                    target_button = button
+                    break
+        if not target_button:
+            print(f"[-] Button not found: {text_or_index}")
+            # Try to find by jsaction attribute (Google's way)
+            for elem in self.current_soup.find_all(attrs={'jsaction': True}):
+                jsaction = elem.get('jsaction', '')
+                if 'click' in jsaction.lower():
+                    print(f"[*] Found element with jsaction: {jsaction}")
+                    # Try to extract URL from onclick or data attributes
+                    return self.handle_js_action(elem)
+            # Check for span inside button with the text (Google's pattern)
+            for button in buttons:
+                spans = button.find_all('span')
+                for span in spans:
+                    span_text = span.get_text(strip=True)
+                    if text_or_index.lower() in span_text.lower():
+                        target_button = button
+                        print(f"[*] Found button via span: {span_text}")
+                        break
+                if target_button:
+                    break
+            if not target_button:
+                return False
+        # Check if button has a form action
+        form = target_button.find_parent('form')
+        if form:
+            action = form.get('action', '')
+            if action:
+                if not action.startswith('http'):
+                    action = urljoin(self.current_url, action)
+                return self.fetch(action)
+        # Check for jsaction attribute
+        jsaction = target_button.get('jsaction', '')
+        if jsaction:
+            return self.handle_js_action(target_button)
+        # For Google signup button, construct the URL manually
+        if 'Create account' in target_button.get_text():
+            # Extract dsh from current URL
+            from urllib.parse import parse_qs, urlparse
+            parsed = urlparse(self.current_url)
+            params = parse_qs(parsed.query)
+            dsh = params.get('dsh', [''])[0]
+            # Construct signup URL (correct endpoint is /signup not /signup/v2/webname)
+            signup_url = f"https://accounts.google.com/signup?dsh={dsh}&flowEntry=SignUp&flowName=GlifWebSignIn"
+            print(f"[*] Navigating to signup URL: {signup_url}")
+            return self.fetch(signup_url)
+        print(f"[-] Button has no actionable URL")
+        return False
+    def handle_js_action(self, elem):
+        """Handle Google's jsaction attribute"""
+        jsaction = elem.get('jsaction', '')
+        print(f"[*] Processing jsaction: {jsaction}")
+        # For Create Account button, construct the signup URL directly
+        elem_text = elem.get_text(strip=True)
+        if 'Create account' in elem_text:
+            # Extract dsh from current URL
+            from urllib.parse import parse_qs, urlparse
+            parsed = urlparse(self.current_url)
+            params = parse_qs(parsed.query)
+            dsh = params.get('dsh', [''])[0]
+            # Construct signup URL (correct endpoint is /signup not /signup/v2/webname)
+            signup_url = f"https://accounts.google.com/signup?dsh={dsh}&flowEntry=SignUp&flowName=GlifWebSignIn"
+            print(f"[*] Navigating to signup URL: {signup_url}")
+            return self.fetch(signup_url)
+        # Extract WIZ data to find the action URL for other jsaction elements
+        wiz_data = self.extract_wiz_data()
+        if wiz_data.get('actions'):
+            action_url = wiz_data['actions'][0]
+            if not action_url.startswith('http'):
+                action_url = 'https://accounts.google.com' + action_url
+            # Add required parameters
+            tokens = wiz_data.get('tokens', {})
+            params = {}
+            if 'dsh' in tokens:
+                params['dsh'] = tokens['dsh']
+            params['flowEntry'] = 'SignUp'
+            params['flowName'] = 'GlifWebSignIn'
+            full_url = action_url
+            if params:
+                from urllib.parse import urlencode
+                separator = '&' if '?' in action_url else '?'
+                full_url += separator + urlencode(params)
+            print(f"[*] Navigating to WIZ action URL: {full_url}")
+            return self.fetch(full_url)
+        print("[-] Could not determine action from jsaction")
+        return False
+    def render_page(self):
+        """Render the current page content"""
+        if not self.current_soup:
+            print("[-] No page loaded")
+            return
+        print("\n" + "="*60)
+        print(f"Current URL: {self.current_url}")
+        print("="*60)
+        # Show title
+        title = self.current_soup.find('title')
+        if title:
+            print(f"\nTitle: {title.get_text(strip=True)}")
+        # Show forms
+        forms = self.get_forms()
+        if forms:
+            print(f"\nForms found: {len(forms)}")
+            for i, form in enumerate(forms):
+                print(f"\n  Form {i}:")
+                print(f"    Action: {form.get('action', 'N/A')}")
+                print(f"    Method: {form.get('method', 'N/A')}")
+                print(f"    WIZ-driven: {form.get('wiz_driven', False)}")
+                if form.get('inputs'):
+                    print(f"    Inputs:")
+                    for inp in form['inputs']:
+                        print(f"      - {inp.get('name')} ({inp.get('type')})")
+        # Show links
+        links = self.get_links()
+        if links:
+            print(f"\nLinks found: {len(links)}")
+            for i, link in enumerate(links[:10]):  # Show first 10
+                print(f"  [{i}] {link['text'][:50]} -> {link['href'][:60]}")
+            if len(links) > 10:
+                print(f"  ... and {len(links) - 10} more")
+        print("="*60 + "\n")
+def main():
+    """Main entry point for testing"""
+    browser = Browser()
+    # Test Google signup flow
+    print("=== Testing Google Signup Flow ===\n")
+    # Step 1: Go to sign-in page
+    browser.fetch("https://accounts.google.com/signin")
+    browser.render_page()
+    # Step 2: Click "Create account"
+    if browser.click_link("Create account"):
+        browser.render_page()
+        # Step 3: Fill in name and submit
+        if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
+            if browser.submit_form(0):
+                browser.render_page()
+                # Check if we reached page 3 (username selection)
+                if 'username' in browser.current_html.lower():
+                    print("\n✓ SUCCESS: Reached username selection page!")
+                else:
+                    print("\n✗ Did not reach username page yet")
+if __name__ == "__main__":
+    main()
+$ cat /workspace/run_jsdom.js 2>/dev/null || echo "File not found"
+cat /workspace/run_jsdom.js 2>/dev/null || echo "File not found"
+const fs = require('fs');
+const path = require('path');
+const { JSDOM } = require('jsdom');
+// Read HTML and JS files
+const htmlPath = process.argv[2];
+const jsPath = process.argv[3];
+if (!htmlPath || !jsPath) {
+    console.error('Usage: node run_jsdom.js <html_file> <js_file>');
+    process.exit(1);
+}
+const html = fs.readFileSync(htmlPath, 'utf-8');
+const jsCode = fs.readFileSync(jsPath, 'utf-8');
+// Create JSDOM instance with comprehensive browser API mocks
+const dom = new JSDOM(html, {
+    url: 'https://accounts.google.com',
+    contentType: 'text/html',
+    includeNodeLocations: true,
+    storageQuota: 10000000,
+    pretendToBeVisual: true,
+    resources: 'usable',
+    runScripts: 'dangerously',
+    beforeParse(window) {
+        // Mock Performance API
+        window.performance = {
+            now: () => Date.now(),
+            getEntriesByType: (type) => {
+                if (type === 'navigation') {
+                    return [{
+                        type: 'navigate',
+                        startTime: 0,
+                        duration: 100,
+                        name: window.location.href,
+                        entryType: 'navigation'
+                    }];
+                }
+                if (type === 'resource') {
+                    return [];
+                }
+                if (type === 'paint') {
+                    return [];
+                }
+                return [];
+            },
+            getEntriesByName: (name) => [],
+            getEntries: () => [],
+            mark: (name) => {},
+            measure: (name, startMark, endMark) => {},
+            clearMarks: (name) => {},
+            clearMeasures: (name) => {},
+            timing: {
+                navigationStart: Date.now(),
+                unloadEventStart: 0,
+                unloadEventEnd: 0,
+                redirectStart: 0,
+                redirectEnd: 0,
+                fetchStart: Date.now(),
+                domainLookupStart: 0,
+                domainLookupEnd: 0,
+                connectStart: 0,
+                connectEnd: 0,
+                secureConnectionStart: 0,
+                requestStart: 0,
+                responseStart: 0,
+                responseEnd: 0,
+                domLoading: 0,
+                domInteractive: 0,
+                domContentLoadedEventStart: 0,
+                domContentLoadedEventEnd: 0,
+                domComplete: 0,
+                loadEventStart: 0,
+                loadEventEnd: 0
+            },
+            navigation: {
+                type: 0,
+                redirectCount: 0
+            }
+        };
+        // Mock ResizeObserver
+        window.ResizeObserver = class ResizeObserver {
+            constructor(callback) {
+                this.callback = callback;
+            }
+            observe(target) {}
+            unobserve(target) {}
+            disconnect() {}
+        };
+        // Mock IntersectionObserver
+        window.IntersectionObserver = class IntersectionObserver {
+            constructor(callback, options) {
+                this.callback = callback;
+                this.options = options;
+            }
+            observe(target) {}
+            unobserve(target) {}
+            disconnect() {}
+        };
+        // Mock crypto
+        window.crypto = {
+            getRandomValues: (array) => {
+                for (let i = 0; i < array.length; i++) {
+                    array[i] = Math.floor(Math.random() * 256);
+                }
+                return array;
+            },
+            subtle: {
+                digest: async () => new ArrayBuffer(32),
+                encrypt: async () => new ArrayBuffer(32),
+                decrypt: async () => new ArrayBuffer(32)
+            }
+        };
+        // Mock Storage APIs
+        const storageData = {};
+        window.localStorage = {
+            getItem: (key) => storageData[key] || null,
+            setItem: (key, value) => { storageData[key] = value; },
+            removeItem: (key) => { delete storageData[key]; },
+            clear: () => { Object.keys(storageData).forEach(k => delete storageData[k]); },
+            length: 0,
+            key: (index) => Object.keys(storageData)[index] || null
+        };
+        window.sessionStorage = { ...window.localStorage };
+        // Mock requestAnimationFrame
+        window.requestAnimationFrame = (callback) => {
+            return setTimeout(() => callback(Date.now()), 16);
+        };
+        window.cancelAnimationFrame = (id) => clearTimeout(id);
+        // Mock matchMedia
+        window.matchMedia = (query) => ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addListener: (fn) => {},
+            removeListener: (fn) => {},
+            addEventListener: (event, fn) => {},
+            removeEventListener: (event, fn) => {},
+            dispatchEvent: (event) => true
+        });
+        // Mock getComputedStyle
+        const originalGetComputedStyle = window.getComputedStyle;
+        window.getComputedStyle = (elem) => {
+            const style = originalGetComputedStyle(elem);
+            // Add missing properties
+            style.getPropertyValue = (prop) => style[prop] || '';
+            return style;
+        };
+        // Mock scrollTo/scroll
+        window.scrollTo = () => {};
+        window.scroll = () => {};
+        window.scrollBy = () => {};
+        // Element scroll methods
+        const origElement = window.Element.prototype;
+        origElement.scrollTo = function() {};
+        origElement.scroll = function() {};
+        origElement.scrollBy = function() {};
+        origElement.scrollIntoView = function() {};
+        // Mock getBoundingClientRect to return reasonable values
+        const origGetBoundingClientRect = window.Element.prototype.getBoundingClientRect;
+        window.Element.prototype.getBoundingClientRect = function() {
+            return {
+                top: 0,
+                left: 0,
+                bottom: 100,
+                right: 100,
+                width: 100,
+                height: 100,
+                x: 0,
+                y: 0,
+                toJSON: function() { return JSON.stringify(this); }
+            };
+        };
+        // Mock clientWidth/clientHeight
+        Object.defineProperty(window.HTMLElement.prototype, 'clientWidth', {
+            get: function() { return 100; }
+        });
+        Object.defineProperty(window.HTMLElement.prototype, 'clientHeight', {
+            get: function() { return 100; }
+        });
+        Object.defineProperty(window.HTMLElement.prototype, 'offsetWidth', {
+            get: function() { return 100; }
+        });
+        Object.defineProperty(window.HTMLElement.prototype, 'offsetHeight', {
+            get: function() { return 100; }
+        });
+        Object.defineProperty(window.HTMLElement.prototype, 'scrollWidth', {
+            get: function() { return 100; }
+        });
+        Object.defineProperty(window.HTMLElement.prototype, 'scrollHeight', {
+            get: function() { return 100; }
+        });
+        // Mock innerWidth/innerHeight
+        Object.defineProperty(window, 'innerWidth', {
+            get: function() { return 1920; }
+        });
+        Object.defineProperty(window, 'innerHeight', {
+            get: function() { return 1080; }
+        });
+        Object.defineProperty(window, 'outerWidth', {
+            get: function() { return 1920; }
+        });
+        Object.defineProperty(window, 'outerHeight', {
+            get: function() { return 1080; }
+        });
+        // Mock devicePixelRatio
+        Object.defineProperty(window, 'devicePixelRatio', {
+            get: function() { return 1; }
+        });
+        // Mock navigator properties
+        const origNavigator = window.navigator;
+        window.navigator = {
+            ...origNavigator,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            platform: 'Win32',
+            language: 'en-US',
+            languages: ['en-US', 'en'],
+            cookieEnabled: true,
+            onLine: true,
+            webdriver: false,
+            hardwareConcurrency: 8,
+            deviceMemory: 8,
+            maxTouchPoints: 0,
+            connection: {
+                effectiveType: '4g',
+                rtt: 50,
+                downlink: 10,
+                saveData: false
+            }
+        };
+        // Mock document properties
+        Object.defineProperty(window.document, 'documentMode', {
+            get: function() { return 11; }
+        });
+        // Mock MutationObserver
+        window.MutationObserver = class MutationObserver {
+            constructor(callback) {
+                this.callback = callback;
+            }
+            observe(target, options) {}
+            disconnect() {}
+            takeRecords() { return []; }
+        };
+        // Mock Promise.resolve/reject for microtasks
+        if (!Promise.resolve.toString().includes('[native code]')) {
+            // Already native, no need to mock
+        }
+        // Mock fetch
+        window.fetch = (url, options) => {
+            return Promise.reject(new Error('Network requests disabled in jsdom'));
+        };
+        // Mock XMLHttpRequest
+        window.XMLHttpRequest = class XMLHttpRequest {
+            open() {}
+            send() {}
+            abort() {}
+            setRequestHeader() {}
+            getResponseHeader() { return null; }
+            getAllResponseHeaders() { return ''; }
+            readyState = 0;
+            status = 0;
+            statusText = '';
+            response = '';
+            responseText = '';
+            responseXML = null;
+            onreadystatechange = null;
+            timeout = 0;
+            withCredentials = false;
+        };
+        // Mock History API
+        window.history = {
+            pushState: (state, title, url) => {
+                if (url) window.location.href = url;
+            },
+            replaceState: (state, title, url) => {
+                if (url) window.location.href = url;
+            },
+            go: (delta) => {},
+            back: () => {},
+            forward: () => {},
+            state: null,
+            length: 1
+        };
+        // Mock location reload/replace
+        const origLocation = window.location;
+        window.location.reload = () => {};
+        window.location.replace = (url) => {
+            window.location.href = url;
+        };
+        // Mock setTimeout/setInterval to be synchronous for testing
+        // (keeping them async but ensuring they work)
+        // Mock CustomEvent
+        window.CustomEvent = class CustomEvent extends Event {
+            constructor(type, params) {
+                params = params || { bubbles: false, cancelable: false, detail: undefined };
+                super(type, params);
+                this.detail = params.detail;
+            }
+        };
+        // Mock DOMParser
+        window.DOMParser = class DOMParser {
+            parseFromString(string, type) {
+                return new JSDOM(string).window.document;
+            }
+        };
+        // Mock URL.createObjectURL/revokeObjectURL
+        window.URL.createObjectURL = (obj) => 'blob:http://example.com/' + Math.random();
+        window.URL.revokeObjectURL = (url) => {};
+        // Mock getSelection
+        window.getSelection = () => ({
+            toString: () => '',
+            rangeCount: 0,
+            getRangeAt: (i) => null,
+            addRange: (range) => {},
+            removeRange: (range) => {},
+            removeAllRanges: () => {},
+            empty: () => {},
+            collapse: () => {},
+            setPosition: () => {},
+            extend: () => {},
+            isCollapsed: true,
+            type: 'None',
+            anchorNode: null,
+            anchorOffset: 0,
+            focusNode: null,
+            focusOffset: 0
+        });
+        // Mock window.name
+        window.name = '';
+        // Mock window.frames
+        window.frames = [];
+        window.length = 0;
+        window.top = window;
+        window.parent = window;
+        window.self = window;
+        // Mock postMessage
+        window.postMessage = (message, targetOrigin, transfer) => {};
+        // Mock addEventListener/removeEventListener for window
+        // (JSDOM provides these, but ensure they exist)
+        // Mock screen
+        window.screen = {
+            width: 1920,
+            height: 1080,
+            availWidth: 1920,
+            availHeight: 1080,
+            colorDepth: 24,
+            pixelDepth: 24,
+            orientation: {
+                type: 'landscape-primary',
+                angle: 0,
+                onchange: null
+            }
+        };
+        // Mock visualViewport
+        window.visualViewport = {
+            width: 1920,
+            height: 1080,
+            offsetLeft: 0,
+            offsetTop: 0,
+            pageLeft: 0,
+            pageTop: 0,
+            scale: 1,
+            clientWidth: 1920,
+            clientHeight: 1080
+        };
+        // Mock CSS
+        window.CSS = {
+            escape: (str) => str.replace(/[\\"]/g, '\\$&'),
+            supports: (property, value) => true
+        };
+        // Mock NamedNodeMap for attributes
+        // (JSDOM handles this)
+        // Mock WindowProperties
+        // (JSDOM handles this)
+    }
+});
+const window = dom.window;
+const document = window.document;
+// Wait for any async initialization
+setTimeout(() => {
+    try {
+        // Execute the user's JavaScript code
+        const vm = require('vm');
+        const context = vm.createContext({
+            window: window,
+            document: document,
+            console: console,
+            require: require,
+            process: process,  // Add process object
+            __jsdom: true,
+            performance: window.performance,
+            localStorage: window.localStorage,
+            sessionStorage: window.sessionStorage,
+            navigator: window.navigator,
+            location: window.location,
+            history: window.history,
+            screen: window.screen,
+            crypto: window.crypto,
+            CustomEvent: window.CustomEvent,
+            Event: window.Event,
+            MouseEvent: window.MouseEvent,
+            KeyboardEvent: window.KeyboardEvent,
+            FocusEvent: window.FocusEvent,
+            InputEvent: window.InputEvent,
+            DOMParser: window.DOMParser,
+            XMLSerializer: window.XMLSerializer,
+            Node: window.Node,
+            Element: window.Element,
+            HTMLElement: window.HTMLElement,
+            Document: window.Document,
+            Blob: window.Blob,
+            File: window.File,
+            FileReader: window.FileReader,
+            FormData: window.FormData,
+            URL: window.URL,
+            URLSearchParams: window.URLSearchParams,
+            Request: window.Request,
+            Response: window.Response,
+            Headers: window.Headers,
+            AbortController: window.AbortController,
+            AbortSignal: window.AbortSignal,
+            TextEncoder: window.TextEncoder,
+            TextDecoder: window.TextDecoder,
+            atob: window.atob,
+            btoa: window.btoa,
+            setTimeout: setTimeout,
+            setInterval: setInterval,
+            clearTimeout: clearTimeout,
+            clearInterval: clearInterval,
+            requestAnimationFrame: window.requestAnimationFrame,
+            cancelAnimationFrame: window.cancelAnimationFrame,
+            Promise: Promise,
+            Map: Map,
+            Set: Set,
+            WeakMap: WeakMap,
+            WeakSet: WeakSet,
+            Symbol: Symbol,
+            Proxy: Proxy,
+            Reflect: Reflect,
+            Array: Array,
+            Object: Object,
+            String: String,
+            Number: Number,
+            Boolean: Boolean,
+            Date: Date,
+            RegExp: RegExp,
+            Error: Error,
+            TypeError: TypeError,
+            SyntaxError: SyntaxError,
+            ReferenceError: ReferenceError,
+            JSON: JSON,
+            Math: Math,
+            Infinity: Infinity,
+            NaN: NaN,
+            undefined: undefined,
+            null: null
+        });
+        // Run the JavaScript code
+        const result = vm.runInContext(jsCode, context, {
+            filename: 'script.js',
+            timeout: 10000
+        });
+        // Output result as JSON if possible
+        if (result !== undefined) {
+            try {
+                console.log(JSON.stringify(result));
+            } catch (e) {
+                console.log(JSON.stringify({ result: String(result) }));
+            }
+        } else {
+            // If no explicit result, output current state
+            console.log(JSON.stringify({
+                url: window.location.href,
+                title: document.title,
+                forms: Array.from(document.forms).map(f => ({
+                    action: f.action,
+                    method: f.method,
+                    inputs: Array.from(f.elements).map(e => ({
+                        name: e.name,
+                        type: e.type,
+                        value: e.value
+                    }))
+                })),
+                links: Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                    text: a.textContent.trim(),
+                    href: a.href
+                }))
+            }));
+        }
+    } catch (error) {
+        console.error(JSON.stringify({ error: error.message, stack: error.stack }));
+        process.exit(1);
+    }
+}, 100);
+$ cat /workspace/test_flow.py 2>/dev/null || echo "File not found"
+cat /workspace/test_flow.py 2>/dev/null || echo "File not found"
+#!/usr/bin/env python3
+"""Test script for Google signup flow"""
+from browser import Browser
+def main():
+    browser = Browser()
+    print("=== Testing Google Signup Flow ===\n")
+    # Step 1: Go to sign-in page
+    print("\n[Step 1] Fetching Google sign-in page...")
+    if not browser.fetch("https://accounts.google.com/signin"):
+        print("Failed to fetch sign-in page")
+        return
+    browser.render_page()
+    # Step 2: Click "Create account" button (not link)
+    print("\n[Step 2] Looking for 'Create account' button...")
+    if browser.click_button("Create account"):
+        browser.render_page()
+        # Extract WIZ data
+        print("\n[Step 2b] Extracting WIZ global data...")
+        wiz_data = browser.extract_wiz_data()
+        if wiz_data:
+            print(f"WIZ tokens found: {list(wiz_data.get('tokens', {}).keys())}")
+            print(f"WIZ actions found: {wiz_data.get('actions', [])}")
+        # Step 3: Fill in name and submit
+        print("\n[Step 3] Filling name form...")
+        if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
+            print("Form filled successfully")
+            print("\n[Step 4] Submitting form...")
+            if browser.submit_form(0):
+                browser.render_page()
+                # Check if we reached the username page (page 3)
+                if 'username' in browser.current_html.lower() or 'choose your username' in browser.current_html.lower():
+                    print("\n✓✓✓ SUCCESS: Reached username selection page (Page 3)! ✓✓✓")
+                else:
+                    print("\n✗ Did not reach username page yet - checking content...")
+                    # Show what we got
+                    title = browser.current_soup.find('title')
+                    if title:
+                        print(f"Current page title: {title.get_text(strip=True)}")
+            else:
+                print("Form submission failed")
+        else:
+            print("Failed to fill form")
     else:
-        print("jsbrowser — curl + python + qjs terminal browser")
-        print("type 'help' for commands")
-        repl(browser, start)
+        print("Could not find 'Create account' button")
+if __name__ == "__main__":
+    main()
