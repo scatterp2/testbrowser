@@ -12,6 +12,7 @@ import random
 import subprocess
 import tempfile
 import os
+import hashlib
 from urllib.parse import urljoin, urlparse, parse_qs
 
 
@@ -324,23 +325,38 @@ class Browser:
         # 1. Extract all necessary tokens - try multiple sources
         tokens = self.wiz_data.get('tokens', {})
 
-        # If WIZ parsing failed, try to extract from URL
+        # If WIZ parsing failed, try to extract from URL and HTML using regex
         if not tokens.get('SNlM0e'):
-            print("  [RPC] WIZ tokens missing, trying URL extraction...")
-            from urllib.parse import urlparse, parse_qs
+            print("  [RPC] WIZ tokens missing, trying URL/HTML extraction...")
             if self.current_url:
                 parsed = urlparse(self.current_url)
                 params = parse_qs(parsed.query)
 
                 # Map URL params to token names
                 if 'TL' in params:
+                    tokens['TL'] = params['TL'][0]
                     tokens['SNlM0e'] = params['TL'][0]  # TL often serves as SNlM0e equivalent
                 if 'dsh' in params:
                     tokens['dsh'] = params['dsh'][0]
-                if 'bl' not in tokens:
-                    tokens['bl'] = 'boq_identityfrontendui_20240520.08_p0'  # Default build
+            
+            # Also try regex extraction from HTML
+            if self.current_html:
+                # Extract SNlM0e/at token
+                snlm0e_match = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', self.current_html)
+                if snlm0e_match and not tokens.get('SNlM0e'):
+                    tokens['SNlM0e'] = snlm0e_match.group(1)
+                
+                # Extract f.sid
+                fsid_match = re.search(r'"f.sid"\s*:\s*"([^"]+)"', self.current_html)
+                if fsid_match:
+                    tokens['f_sid'] = fsid_match.group(1)
+                
+                # Extract bl (build label)
+                bl_match = re.search(r'"bl"\s*:\s*"([^"]+)"', self.current_html)
+                if bl_match:
+                    tokens['bl'] = bl_match.group(1)
 
-        if not tokens.get('SNlM0e'):
+        if not tokens.get('TL') and not tokens.get('SNlM0e'):
             print("  [RPC] Critical tokens still missing, cannot proceed with RPC.")
             return False
 
@@ -429,7 +445,7 @@ class Browser:
 
         form_data = {
             'f.req': json.dumps(batch_payload),
-            'at': tokens.get('SNlM0e', ''),
+            'at': tokens.get('SNlM0e', tokens.get('TL', '')),
             'bl': tokens.get('bl', 'boq_identityfrontendui_20240520.08_p0'),
         }
 
@@ -468,9 +484,9 @@ class Browser:
                     'rpcids': 'MjyMj',
                     'source-path': '/lifecycle/steps/signup/name',
                     'f.sid': tokens.get('f_sid', '1361846779993695398'),
-                    'bl': tokens.get('bl', 'boq_identity-account-creation-evolution-ui_20260512.06_p0'),
+                    'bl': tokens.get('bl', 'boq_identityfrontendui_20240520.08_p0'),
                     'hl': 'en-US',
-                    'TL': tokens.get('SNlM0e', ''),
+                    'TL': tokens.get('TL', tokens.get('SNlM0e', '')),
                     '_reqid': str(random.randint(10000, 999999)),
                     'rt': 'c'
                 },
@@ -1159,43 +1175,87 @@ class Browser:
 
 
 def main():
-    """Main entry point for testing"""
+    """Main entry point for testing - Google Account Signup Flow"""
     browser = Browser()
-
-    # Test Google signup flow
-    print("=== Testing Google Signup Flow ===\n")
-
-    # Step 1: Go to sign-in page
+    
+    print("--- Step 1: Navigate to Sign In ---")
     browser.fetch("https://accounts.google.com/signin")
-    browser.render_page()
-
-    # Step 2: Click "Create account"
-    if browser.click_button("Create account"):
-        browser.render_page()
-
-    # Step 3: Fill in name and submit using HAR-matched RPC
-    if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
-        print("[*] Submitting name form via HAR-matched RPC...")
-        response = browser.submit_name_form('steve', 'boils')
-        if response:
-            browser.render_page()
-            if 'username' in browser.current_url.lower() or 'name' not in browser.current_url.lower():
-                print("\n✓ SUCCESS: Moved past name page!")
-                print(f"Current URL: {browser.current_url}")
-            else:
-                print("\n✗ Still on name page")
-                print(f"Current URL: {browser.current_url}")
-        else:
-            print("[!] submit_name_form returned None/False")
-            if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
-                if browser.submit_form(0):
-                    browser.render_page()
-
-    # Check if we reached page 3 (username selection)
-    if 'username' in browser.current_html.lower():
-        print("\n✓ SUCCESS: Reached username selection page!")
-    else:
-        print("\n✗ Did not reach username page yet")
+    # print(browser.render_page()) # Optional: View page
+    
+    print("\n--- Step 2: Click Create Account ---")
+    # Look for "Create account" link/button
+    browser.click_button("Create account")
+    # The click_handler should detect WIZ and auto-navigate or we might need to fetch manually if it's a simple link
+    # Assuming the click extracted the URL and we need to fetch it if auto-nav didn't happen
+    if 'signup' not in browser.current_url:
+        # Fallback: Find the link manually if click_button didn't trigger fetch
+        for a in browser.soup.find_all('a'):
+            if 'Create account' in a.get_text():
+                href = a.get('href')
+                if href:
+                    browser.fetch(href)
+                    break
+    
+    print(f"Current URL: {browser.current_url}")
+    
+    print("\n--- Step 3: Fill Name Page ---")
+    # Fill First and Last Name
+    browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'})
+    # Submit via RPC
+    browser.submit_wiz_rpc('userspace.NameSubmit')
+    
+    print(f"Current URL: {browser.current_url}")
+    # print(browser.render_page())
+    
+    print("\n--- Step 4: Select Username ---")
+    # The previous step should have landed us on the username page
+    # We need to pick a suggestion. Usually the first one or a generated one.
+    # For this demo, we assume the logic picks 'steveboils' + random
+    # In a real scenario, we'd parse the suggestions from the DOM.
+    # Let's simulate filling the custom username field if available, or clicking a suggestion.
+    # Google often auto-selects the first available. If we need to type:
+    rand_num = str(random.randint(100000, 999999))
+    username = f"steveboils{rand_num}"
+    
+    # Try to fill the username field (often id="username" or similar)
+    browser.fill_form(0, {'username': username})
+    
+    # Click Next
+    browser.click_button("Next")
+    
+    print(f"Current URL: {browser.current_url}")
+    
+    print("\n--- Step 5: Birthday & Gender ---")
+    # Fill Birthday
+    browser.fill_form(0, {
+        'month': '1', # January
+        'day': '15',
+        'year': '1990',
+        'gender': '1' # Male
+    })
+    browser.click_button("Next")
+    
+    print(f"Current URL: {browser.current_url}")
+    # print(browser.render_page())
+    
+    print("\n--- Step 6: Password Creation ---")
+    # Generate Password: MD5(email) + "!"
+    email = f"{username}@gmail.com"
+    md5_hash = hashlib.md5(email.encode()).hexdigest()
+    password = f"{md5_hash}!"
+    
+    print(f"Generated Password for {email}: {password}")
+    
+    browser.fill_form(0, {
+        'password': password,
+        'confirm_password': password
+    })
+    browser.click_button("Next")
+    
+    print(f"Current URL: {browser.current_url}")
+    
+    print("\n--- Final Page Content ---")
+    print(browser.render_page())
 
 
 if __name__ == "__main__":
