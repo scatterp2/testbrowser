@@ -45,8 +45,7 @@ function installBrowserMocks(window, networkLog) {
   Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
 
   window.fetch = (url, options = {}) => {
-    const headers = Object.fromEntries(new window.Headers(options.headers || {}).entries());
-    networkLog.push({ type: 'fetch', url: String(url), method: options.method || 'GET', headers, body: options.body || null });
+    networkLog.push({ type: 'fetch', url: String(url), method: options.method || 'GET', body: options.body || null });
     return Promise.resolve({
       ok: true,
       status: 204,
@@ -73,7 +72,7 @@ function installBrowserMocks(window, networkLog) {
     setRequestHeader(name, value) { this.headers[name] = value; }
     getResponseHeader() { return null; }
     send(body = null) {
-      networkLog.push({ type: 'xhr', url: String(this.url), method: this.method || 'GET', headers: this.headers, body });
+      networkLog.push({ type: 'xhr', url: String(this.url), method: this.method || 'GET', body });
       this.readyState = 4;
       this.status = 204;
       if (this.onreadystatechange) this.onreadystatechange();

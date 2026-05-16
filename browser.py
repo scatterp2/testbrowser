@@ -286,125 +286,35 @@ class Browser:
         return True
 
     def submit_wiz_rpc(self, field_mapping=None):
-        """Submit a JavaScript-driven form by letting page code build the request.
+        """Submit the current Google WIZ step via HAR-derived batchexecute RPCs.
 
-        This is intentionally a browser primitive rather than a Google-signup
-        protocol table. The current DOM is loaded in jsdom, form controls are
-        populated with pending values, and the likely submit/next control is
-        clicked. If page JavaScript issues fetch/XHR, the Python session replays
-        that captured request with its cookies and headers.
+        Older versions of this prototype tried to invent ``userspace.*`` RPC
+        names from DOM text. The signup HAR checked into this repo shows that
+        the name step uses the compact RPC id ``E815hb`` and the exact inner
+        payload ``[firstName,lastName,null,null,null,[],null,1]``. Route known
+        signup steps through the dedicated helpers and leave unknown steps as a
+        clear failure instead of posting malformed data.
         """
-        print("  [RPC] Running DOM-driven JavaScript submission...")
+        print("  [RPC] Detecting WIZ RPC submission...")
         pending = getattr(self, 'pending_form_data', {}) or {}
-        return self.submit_js_interactive_form(pending, submit_text=field_mapping)
+        current_url = self.current_url or ''
+        requested = field_mapping if isinstance(field_mapping, str) else ''
 
-    def _build_interaction_script(self, form_data, submit_text=None):
-        """Build a jsdom-side script that fills fields and activates submit."""
-        payload = json.dumps(form_data)
-        desired_text = json.dumps(submit_text or '')
-        return f'''
-        const data = {payload};
-        const desiredText = {desired_text}.toLowerCase();
-        const changed = [];
-        function labelFor(el) {{
-          const labels = [];
-          if (el.id) {{
-            const explicit = document.querySelector(`label[for="${{CSS.escape(el.id)}}"]`);
-            if (explicit) labels.push(explicit.textContent || '');
-          }}
-          const parent = el.closest('label');
-          if (parent) labels.push(parent.textContent || '');
-          labels.push(el.getAttribute('aria-label') || '');
-          labels.push(el.getAttribute('placeholder') || '');
-          labels.push(el.getAttribute('autocomplete') || '');
-          labels.push(el.name || el.id || '');
-          return labels.join(' ');
-        }}
-        function semanticValue(el) {{
-          const name = (el.name || el.id || '').toLowerCase();
-          const text = labelFor(el).toLowerCase();
-          const haystack = `${{name}} ${{text}}`.replace(/[-_]/g, '');
-          for (const [key, value] of Object.entries(data)) {{
-            if (haystack.includes(key.toLowerCase().replace(/[-_]/g, ''))) return value;
-          }}
-          const aliases = [
-            [['first','given'], 'firstName'], [['last','family','surname'], 'lastName'],
-            [['user','email'], 'username'], [['pass'], 'password'],
-            [['phone','mobile','tel'], 'phoneNumber'], [['day'], 'day'],
-            [['month'], 'month'], [['year'], 'year'], [['gender'], 'gender'],
-            [['confirm'], 'confirm']
-          ];
-          for (const [needles, key] of aliases) {{
-            if (needles.some((needle) => haystack.includes(needle)) && data[key] !== undefined) return data[key];
-          }}
-          return undefined;
-        }}
-        function fire(el) {{
-          for (const type of ['input', 'change', 'blur']) {{
-            el.dispatchEvent(new window.Event(type, {{ bubbles: true }}));
-          }}
-        }}
-        for (const el of Array.from(document.querySelectorAll('input, textarea, select'))) {{
-          if (el.disabled || el.type === 'hidden' || el.type === 'submit' || el.type === 'button') continue;
-          const value = semanticValue(el);
-          if (value === undefined || value === null) continue;
-          if (el.tagName === 'SELECT') {{
-            const wanted = String(value).toLowerCase();
-            const option = Array.from(el.options).find((opt) =>
-              opt.value.toLowerCase() === wanted || opt.textContent.trim().toLowerCase() === wanted);
-            if (option) el.value = option.value;
-          }} else if (el.type === 'checkbox' || el.type === 'radio') {{
-            el.checked = Boolean(value) && (String(value).toLowerCase() !== 'false');
-          }} else {{
-            el.value = String(value);
-          }}
-          changed.push(el.name || el.id || labelFor(el));
-          fire(el);
-        }}
-        const controls = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]'));
-        const submit = controls.find((el) => desiredText && (el.textContent || el.value || '').toLowerCase().includes(desiredText)) ||
-          controls.find((el) => /^(next|continue|submit|create|i agree|yes|verify)$/i.test((el.textContent || el.value || '').trim())) ||
-          controls[controls.length - 1];
-        if (submit) submit.click();
-        result.changed = changed;
-        result.clicked = submit ? (submit.textContent || submit.value || submit.getAttribute('aria-label') || '').trim() : null;
-        result.location = window.location.href;
-        '''
+        if '/lifecycle/steps/signup/name' in current_url or 'NameSubmit' in requested:
+            first_name = pending.get('firstName') or pending.get('first_name') or pending.get('givenName') or ''
+            last_name = pending.get('lastName') or pending.get('last_name') or pending.get('familyName') or ''
+            if not first_name and self.current_soup:
+                first = self.current_soup.find('input', attrs={'name': re.compile('first|given', re.I)})
+                first_name = first.get('value', '') if first else ''
+            if not last_name and self.current_soup:
+                last = self.current_soup.find('input', attrs={'name': re.compile('last|family', re.I)})
+                last_name = last.get('value', '') if last else ''
+            if not first_name:
+                print("  [RPC] Cannot submit name step without a first name.")
+                return False
+            return self.submit_name_form(first_name, last_name)
 
-    def _absolute_request_url(self, url):
-        return urljoin(self.current_url or 'https://accounts.google.com/', url)
-
-    def _replay_js_request(self, request_info):
-        """Replay a fetch/XHR captured from jsdom using the Python session."""
-        method = (request_info.get('method') or 'GET').upper()
-        url = self._absolute_request_url(request_info.get('url') or self.current_url or '')
-        headers = request_info.get('headers') or {}
-        body = request_info.get('body')
-        print(f"[*] Replaying JS {method} request to {url}")
-        response = self.session.request(method, url, data=body, headers=headers, allow_redirects=True)
-        self.last_response = response
-        self.current_url = response.url
-        self.current_html = response.text
-        self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
-        return response.status_code < 400
-
-    def submit_js_interactive_form(self, form_data=None, submit_text=None):
-        """Fill and submit the current DOM with JavaScript, replaying captured I/O."""
-        form_data = form_data or {}
-        result = self.execute_js(self._build_interaction_script(form_data, submit_text=submit_text))
-        if not result:
-            print("[-] JavaScript interaction failed")
-            return False
-        for request_info in result.get('networkLog', []):
-            if request_info.get('url'):
-                return self._replay_js_request(request_info)
-        html = result.get('html')
-        if html and html != self.current_html:
-            self.current_html = html
-            self.current_soup = BeautifulSoup(html, 'html.parser')
-            self.current_url = result.get('result', {}).get('location') or self.current_url
-            return True
-        print("[-] Page JavaScript did not produce a network request or DOM transition")
+        print(f"  [RPC] No HAR-backed submitter for current URL: {current_url}")
         return False
 
     def submit_form(self, form_index=None):
@@ -475,6 +385,318 @@ class Browser:
             print(f"[-] Form submission failed: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 print(f"[-] Response status: {e.response.status_code}")
+            return False
+
+    def _extract_signup_tokens(self):
+        """Collect Google signup RPC tokens from WIZ data, URL params, and HTML."""
+        tokens = dict(self.wiz_data.get('tokens', {}) if isinstance(self.wiz_data, dict) else {})
+        parsed_url = urlparse(self.current_url or '')
+        url_params = parse_qs(parsed_url.query)
+
+        for key in ('TL', 'dsh', 'hl'):
+            if key in url_params and not tokens.get(key):
+                tokens[key] = url_params[key][0]
+
+        html = self.current_html or ''
+        patterns = {
+            'SNlM0e': [r'"SNlM0e"\s*:\s*"([^"]+)"', r'\["SNlM0e","([^"]+)"\]', r'\bat=([^&"\']+)'],
+            'f.sid': [r'"FdrFJe"\s*:\s*"?(-?\d+)"?', r'"f\.sid"\s*:\s*"?(-?\d+)"?'],
+            'bl': [r'boq_identity-account-creation-evolution-ui_[A-Za-z0-9_.-]+'],
+        }
+        for key, candidates in patterns.items():
+            if tokens.get(key):
+                continue
+            for pattern in candidates:
+                match = re.search(pattern, html)
+                if match:
+                    tokens[key] = match.group(1) if match.groups() else match.group(0)
+                    break
+
+        if not tokens.get('f.sid'):
+            tokens['f.sid'] = str(random.randint(1000000000000000000, 9999999999999999999))
+        if not tokens.get('bl'):
+            tokens['bl'] = 'boq_identity-account-creation-evolution-ui_20260512.06_p0'
+        if not tokens.get('hl'):
+            tokens['hl'] = 'en-US'
+        return tokens, parsed_url, url_params
+
+    def _parse_batchexecute_response(self, text):
+        """Parse Google's )]}' length-prefixed batchexecute response."""
+        if text.startswith(")]}'"):
+            text = text[4:]
+        lines = text.strip().split('\n')
+        parsed_items = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            if line.isdigit():
+                length = int(line)
+                i += 1
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+                if i < len(lines):
+                    try:
+                        parsed_items.extend(json.loads(lines[i]))
+                        i += 1
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                json_str = ''
+                while i < len(lines) and len(json_str) < length:
+                    if json_str:
+                        json_str += '\n'
+                    json_str += lines[i]
+                    i += 1
+                try:
+                    parsed_items.extend(json.loads(json_str))
+                except json.JSONDecodeError:
+                    pass
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, list):
+                    parsed_items.extend(parsed if parsed and isinstance(parsed[0], list) else [parsed])
+            except json.JSONDecodeError:
+                pass
+            i += 1
+        return parsed_items
+
+    def _find_lifecycle_step(self, value):
+        """Return the first steps/signup/... path found in nested JSON-ish data."""
+        if isinstance(value, str):
+            if value.startswith('steps/signup/'):
+                return value
+            try:
+                return self._find_lifecycle_step(json.loads(value))
+            except (json.JSONDecodeError, TypeError):
+                match = re.search(r'steps/signup/[A-Za-z0-9_-]+', value)
+                return match.group(0) if match else None
+        if isinstance(value, list):
+            for item in value:
+                found = self._find_lifecycle_step(item)
+                if found:
+                    return found
+        if isinstance(value, dict):
+            for item in value.values():
+                found = self._find_lifecycle_step(item)
+                if found:
+                    return found
+        return None
+
+    def submit_wiz_batchexecute(self, rpcid, inner_data_array, source_path):
+        """Submit a Google WIZ batchexecute RPC using the HAR-observed format."""
+        tokens, parsed_url, url_params = self._extract_signup_tokens()
+        tl = tokens.get('TL')
+        at = tokens.get('SNlM0e')
+        dsh = tokens.get('dsh') or url_params.get('dsh', [None])[0]
+
+        if not tl:
+            print("ERROR: Missing TL token; fetch the signup step before submitting.")
+            return None
+        if not at:
+            print("ERROR: Missing SNlM0e/at token; Google will reject batchexecute without it.")
+            return None
+
+        inner_json_str = json.dumps(inner_data_array, separators=(',', ':'))
+        f_req_data = [[[rpcid, inner_json_str, None, "generic"]]]
+        post_data = {
+            'f.req': json.dumps(f_req_data, separators=(',', ':')),
+            'at': at,
+            '': '',
+        }
+
+        query = {
+            'rpcids': rpcid,
+            'source-path': source_path,
+            'f.sid': tokens['f.sid'],
+            'bl': tokens['bl'],
+            'hl': tokens['hl'],
+            'TL': tl,
+            '_reqid': str(random.randrange(100000, 999999)),
+            'rt': 'c',
+        }
+        endpoint = 'https://accounts.google.com/lifecycle/_/AccountLifecyclePlatformSignupUi/data/batchexecute'
+        full_url = f"{endpoint}?{urlencode(query)}"
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+            'Origin': 'https://accounts.google.com',
+            'Referer': self.current_url or f'https://accounts.google.com{source_path}',
+            'X-Same-Domain': '1',
+            'X-Same-Origin': '1',
+        }
+
+        print("\n=== SUBMITTING BATCHEXECUTE RPC ===")
+        print(f"RPC: {rpcid}")
+        print(f"URL: {full_url}")
+        print(f"f.req: {post_data['f.req'][:200]}...")
+
+        try:
+            response = self.session.post(full_url, data=post_data, headers=headers)
+        except Exception as e:
+            print(f"Request failed: {e}")
+            return None
+
+        self.last_response = response
+        parsed_items = self._parse_batchexecute_response(response.text)
+        print(f"Status: {response.status_code}; parsed {len(parsed_items)} batchexecute item(s)")
+
+        next_step = self._find_lifecycle_step(parsed_items) or self._find_lifecycle_step(response.text)
+        if next_step:
+            next_url = f"https://accounts.google.com/lifecycle/{next_step}"
+            preserved = {key: values[0] for key, values in url_params.items() if values}
+            if dsh and 'dsh' not in preserved:
+                preserved['dsh'] = dsh
+            if tl and 'TL' not in preserved:
+                preserved['TL'] = tl
+            if preserved:
+                next_url += '?' + urlencode(preserved)
+            print(f"✓ SUCCESS: Next page detected: {next_url}")
+            self.pending_form_data = {}
+            return self.fetch(next_url)
+
+        self.current_html = response.text
+        self.current_soup = BeautifulSoup(response.text, 'html.parser')
+        return response
+
+    def submit_name_form(self, first_name, last_name):
+        """
+        Submit the name form using the batchexecute protocol.
+        Based on HAR analysis, use RPC ID 'E815hb' with flat array format:
+        [firstName, lastName, null, null, null, [], null, 1]
+        """
+        # Construct the inner data array - FLAT structure as per HAR
+        inner_data = [
+            first_name,   # Index 0: firstName
+            last_name,    # Index 1: lastName
+            None,         # Index 2: middleName
+            None,         # Index 3: fullName
+            None,         # Index 4: prefix
+            [],           # Index 5: empty array (NOT null!)
+            None,         # Index 6: unknown
+            1             # Index 7: flag
+        ]
+
+        return self.submit_wiz_batchexecute(
+            rpcid='E815hb',
+            inner_data_array=inner_data,
+            source_path='/lifecycle/steps/signup/name'
+        )
+
+    def submit_wiz_form(self, form):
+        """Submit a WIZ-driven form using JavaScript"""
+        print("[*] Submitting WIZ-driven form...")
+
+        # Get form data
+        form_data = getattr(self, 'pending_form_data', {})
+        tokens = form.get('tokens', {})
+
+        # Build JavaScript for form submission
+        script = '''
+        const fs = require('fs');
+        const path = process.argv[2];
+        const html = fs.readFileSync(path, 'utf-8');
+
+        // Extract the actual submission endpoint from WIZ data
+        const wizMatch = html.match(/window\\._WIZ_global_data\\s*=\\s*({[\\s\\S]*?});/);
+
+        let submitUrl = "''' + self.current_url + '''";
+        let additionalParams = {};
+
+        if (wizMatch) {
+            try {
+                const wizData = JSON.parse(wizMatch[1]);
+
+                // Look for nextPageUrl or action URLs
+                if (wizData.nextPageUrl) {
+                    submitUrl = wizData.nextPageUrl;
+                }
+
+                // Search for RPC endpoints
+                function findRpcEndpoints(obj) {
+                    if (Array.isArray(obj)) {
+                        for (let item of obj) {
+                            if (typeof item === 'string' && item.includes('/signup/') && item.includes('/webname')) {
+                                submitUrl = 'https://accounts.google.com' + item;
+                            }
+                            findRpcEndpoints(item);
+                        }
+                    }
+                }
+                findRpcEndpoints(wizData);
+
+                // Extract additional required parameters
+                if (wizData.TL) additionalParams.TL = wizData.TL;
+                if (wizData.dsh) additionalParams.dsh = wizData.dsh;
+            } catch (e) {
+                console.error("Error parsing WIZ data:", e);
+            }
+        }
+
+        // Prepare the payload
+        const payload = {
+            url: submitUrl,
+            params: additionalParams,
+            formData: ''' + json.dumps(form_data) + ''',
+            tokens: ''' + json.dumps(tokens) + '''
+        };
+
+        console.log(JSON.stringify(payload));
+        '''
+
+        result = self.execute_js(script)
+        if not result:
+            print("[-] Failed to prepare WIZ form submission")
+            return False
+
+        submit_url = result.get('url', self.current_url)
+        additional_params = result.get('params', {})
+        form_payload = result.get('formData', {})
+        tokens = result.get('tokens', {})
+
+        # Merge all parameters
+        form_payload.update(additional_params)
+        form_payload.update(tokens)
+
+        print(f"[*] Submitting to: {submit_url}")
+        print(f"[*] Payload: {form_payload}")
+
+        try:
+            # Try different content types that Google might expect
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Same-Origin': '1',
+            }
+
+            response = self.session.post(
+                submit_url,
+                data=form_payload,
+                headers=headers,
+                allow_redirects=True
+            )
+
+            # Check if we got redirected to the next page
+            if response.status_code in [200, 302, 303]:
+                self.current_url = response.url
+                self.current_html = response.text
+                self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
+
+                print(f"[+] Submission successful, now at: {self.current_url}")
+
+                # Check if we reached the username page (page 3)
+                if 'username' in self.current_html.lower() or 'choose your username' in self.current_html.lower():
+                    print("[+] SUCCESS: Reached username selection page (Page 3)!")
+
+                return True
+            else:
+                print(f"[-] Unexpected status code: {response.status_code}")
+                print(f"[-] Response: {response.text[:500]}")
+                return False
+
+        except Exception as e:
+            print(f"[-] WIZ form submission failed: {e}")
             return False
 
     def click_link(self, text_or_index):

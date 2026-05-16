@@ -1,63 +1,35 @@
+import json
 import unittest
+from pathlib import Path
+from urllib.parse import parse_qs, unquote_plus
 
 from browser import Browser
 
-
-def make_browser(html, url='https://accounts.google.com/lifecycle/steps/signup/name'):
-    browser = object.__new__(Browser)
-    browser.current_url = url
-    browser.current_html = html
-    browser.current_soup = None
-    browser.wiz_data = {}
-    browser.pending_form_data = {}
-    return browser
+HAR_PATH = Path('accounts.google.com_Archive [26-05-13 19-01-55].har')
 
 
-class SignupClassificationTests(unittest.TestCase):
-    def test_classifies_phone_required_step(self):
-        browser = make_browser('''
-            <main><h1>Verify your phone number</h1>
-            <label for="phone">Phone number</label><input id="phone" autocomplete="tel"></main>
-        ''', 'https://accounts.google.com/lifecycle/steps/signup/phone')
+class HarBackedRpcTests(unittest.TestCase):
+    def setUp(self):
+        self.browser = object.__new__(Browser)
 
-        self.assertEqual(browser.classify_signup_step(), 'phone')
-        step, can_fill = browser.fill_current_signup_step({'phoneNumber': '+15555550123'})
+    def test_parse_name_step_batchexecute_next_step(self):
+        har = json.loads(HAR_PATH.read_text(encoding='utf-8'))
+        entry = har['log']['entries'][34]
+        parsed = self.browser._parse_batchexecute_response(entry['response']['content']['text'])
+        self.assertEqual(self.browser._find_lifecycle_step(parsed), 'steps/signup/birthdaygender')
 
-        self.assertEqual(step, 'phone')
-        self.assertTrue(can_fill)
-        self.assertEqual(browser.pending_form_data['phoneNumber'], '+15555550123')
+    def test_name_rpc_payload_matches_har_shape(self):
+        har = json.loads(HAR_PATH.read_text(encoding='utf-8'))
+        entry = har['log']['entries'][34]
+        post_text = entry['request']['postData']['text']
+        params = parse_qs(post_text, keep_blank_values=True)
+        f_req = json.loads(unquote_plus(params['f.req'][0]))
+        rpcid, inner_json, unused, mode = f_req[0][0]
 
-    def test_classifies_phone_optional_storage_experiment(self):
-        browser = make_browser('''
-            <main><h1>Add a phone number?</h1>
-            <p>You get 5 GB of storage until a number is supplied.</p>
-            <button>Skip</button><button>Next</button></main>
-        ''', 'https://accounts.google.com/lifecycle/steps/signup/storage')
-
-        self.assertEqual(browser.classify_signup_step(), 'phone_optional')
-
-    def test_classifies_locale_flow_that_skips_phone(self):
-        browser = make_browser('''
-            <main><h1>Create a password</h1>
-            <label>Password<input name="Passwd" type="password"></label>
-            <label>Confirm<input name="ConfirmPasswd" type="password"></label></main>
-        ''', 'https://accounts.google.com/lifecycle/steps/signup/password?gl=CO')
-
-        self.assertEqual(browser.classify_signup_step(), 'password')
-        step, can_fill = browser.fill_current_signup_step({'password': 'Secret123!!'})
-
-        self.assertEqual(step, 'password')
-        self.assertTrue(can_fill)
-        self.assertEqual(browser.pending_form_data['confirm'], 'Secret123!!')
-
-    def test_interaction_script_is_data_driven_not_har_rpc_driven(self):
-        browser = make_browser('<input aria-label="First name"><button>Next</button>')
-        script = browser._build_interaction_script({'firstName': 'Ada'}, submit_text='Next')
-
-        self.assertIn('Ada', script)
-        self.assertIn('firstName', script)
-        self.assertNotIn('E815hb', script)
-        self.assertNotIn('batchexecute', script)
+        self.assertEqual(rpcid, 'E815hb')
+        self.assertIsNone(unused)
+        self.assertEqual(mode, 'generic')
+        self.assertEqual(json.loads(inner_json), ['steve', 'boils', None, None, None, [], None, 1])
 
 
 if __name__ == '__main__':

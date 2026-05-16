@@ -2,12 +2,12 @@
   "name": "testbrowser",
   "version": "0.1.0",
   "private": true,
-  "description": "Lightweight text browser prototype with jsdom-backed DOM, JavaScript execution, and captured network replay.",
+  "description": "Lightweight text browser prototype with jsdom-backed DOM and JavaScript execution.",
   "type": "commonjs",
   "scripts": {
     "check:js": "node --check run_jsdom.js"
   },
   "dependencies": {
-    "jsdom": "^29.1.1"
+    "jsdom": "https://github.com/scatterp2/testbrowser/raw/8eb8f60db2d61b5b35108bbbd063162df93a9953/jsdom-29.1.1.tgz"
   }
 }
