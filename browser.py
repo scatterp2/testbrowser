@@ -19,10 +19,35 @@ import random
 import subprocess
 import tempfile
 import os
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, unquote
 
 
 class Browser:
+
+    MONTH_NAMES = {
+        'jan': 1, 'january': 1,
+        'feb': 2, 'february': 2,
+        'mar': 3, 'march': 3,
+        'apr': 4, 'april': 4,
+        'may': 5,
+        'jun': 6, 'june': 6,
+        'jul': 7, 'july': 7,
+        'aug': 8, 'august': 8,
+        'sep': 9, 'sept': 9, 'september': 9,
+        'oct': 10, 'october': 10,
+        'nov': 11, 'november': 11,
+        'dec': 12, 'december': 12,
+    }
+
+    GENDER_CODES = {
+        'rather not say': 1,
+        'prefer not to say': 1,
+        'unspecified': 1,
+        'female': 2,
+        'male': 3,
+        'custom': 4,
+    }
+
     def __init__(self):
         if requests is None or BeautifulSoup is None:
             raise RuntimeError("Missing dependencies. Install them with: python3 -m pip install -r requirements.txt")
@@ -314,6 +339,16 @@ class Browser:
                 return False
             return self.submit_name_form(first_name, last_name)
 
+        if '/lifecycle/steps/signup/birthdaygender' in current_url or 'BirthdayGenderSubmit' in requested:
+            day = pending.get('day') or pending.get('birthDay') or pending.get('birthday_day')
+            month = pending.get('month') or pending.get('birthMonth') or pending.get('birthday_month')
+            year = pending.get('year') or pending.get('birthYear') or pending.get('birthday_year')
+            gender = pending.get('gender') or pending.get('Gender') or pending.get('sex') or 'Rather not say'
+            if not all([day, month, year]):
+                print("  [RPC] Cannot submit birthday/gender step without day, month, and year.")
+                return False
+            return self.submit_birthdaygender_form(day=day, month=month, year=year, gender=gender)
+
         print(f"  [RPC] No HAR-backed submitter for current URL: {current_url}")
         return False
 
@@ -560,6 +595,84 @@ class Browser:
         self.current_html = response.text
         self.current_soup = BeautifulSoup(response.text, 'html.parser')
         return response
+
+    def _coerce_positive_int(self, value, field_name):
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} must be an integer")
+        if parsed <= 0:
+            raise ValueError(f"{field_name} must be positive")
+        return parsed
+
+    def _month_number(self, value):
+        if isinstance(value, int):
+            return value
+        text = str(value).strip().lower()
+        if text.isdigit():
+            return int(text)
+        if text in self.MONTH_NAMES:
+            return self.MONTH_NAMES[text]
+        raise ValueError(f"Unknown month: {value}")
+
+    def _gender_code(self, value):
+        if isinstance(value, int):
+            return value
+        text = str(value).strip().lower()
+        if text.isdigit():
+            return int(text)
+        return self.GENDER_CODES.get(text, 1)
+
+    def _continue_url_for_signup_payload(self, explicit=None):
+        if explicit:
+            return explicit
+        if self.current_url:
+            params = parse_qs(urlparse(self.current_url).query)
+            if params.get('continue'):
+                return unquote(params['continue'][0])
+        return 'https://accounts.google.com/'
+
+    def _extract_recaptcha_token_candidates(self):
+        """Return long recaptcha-like challenge tokens embedded in the current HTML, if any."""
+        html = self.current_html or ''
+        candidates = []
+        for pattern in (r'"(<[A-Za-z0-9_-]{100,})"', r"'(<[A-Za-z0-9_-]{100,})'"):
+            for match in re.finditer(pattern, html):
+                value = match.group(1)
+                if value not in candidates:
+                    candidates.append(value)
+        return candidates
+
+    def submit_birthdaygender_form(self, day, month, year, gender='Rather not say', continue_url=None, recaptcha_token=None):
+        """Submit the birthday/gender step using the HAR-observed eOY7Bb RPC shape."""
+        date = [
+            self._coerce_positive_int(year, 'year'),
+            self._month_number(month),
+            self._coerce_positive_int(day, 'day'),
+        ]
+        gender_code = self._gender_code(gender)
+        if not 1 <= date[1] <= 12:
+            raise ValueError('month must be between 1 and 12')
+        if not 1 <= date[2] <= 31:
+            raise ValueError('day must be between 1 and 31')
+
+        recaptcha_tokens = [recaptcha_token] if recaptcha_token else self._extract_recaptcha_token_candidates()
+        inner_data = [
+            date,
+            gender_code,
+            None,
+            None,
+            None,
+            None,
+            [None, None, self._continue_url_for_signup_payload(continue_url)],
+            recaptcha_tokens,
+        ]
+
+        return self.submit_wiz_batchexecute(
+            rpcid='eOY7Bb',
+            inner_data_array=inner_data,
+            source_path='/lifecycle/steps/signup/birthdaygender'
+        )
 
     def submit_name_form(self, first_name, last_name):
         """
@@ -935,6 +1048,30 @@ class Browser:
                     return {'status': 'blocked', 'reason': 'phone_verification', 'history': history + [new_step], 'url': self.current_url}
                 submitted_phone = True
         return {'status': 'blocked', 'reason': 'max_steps', 'history': history, 'url': self.current_url}
+
+    def submit_js_interactive_form(self, data=None, submit_text='next'):
+        """Submit the current interactive page through known RPCs or a normal form fallback."""
+        if data is not None:
+            self.pending_form_data = data
+
+        self.extract_wiz_data()
+        current_url = self.current_url or ''
+        if '/lifecycle/steps/signup/' in current_url:
+            if self.submit_wiz_rpc(submit_text):
+                return True
+            return False
+
+        forms = self.get_forms()
+        if forms:
+            if data is not None:
+                self.fill_form(0, data)
+            return self.submit_form(0)
+
+        if submit_text and self.click_button(submit_text):
+            return True
+
+        print('[-] No interactive form or supported RPC submitter found')
+        return False
 
     def render_page(self):
         """Render the current page content"""
