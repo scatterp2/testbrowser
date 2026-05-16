@@ -7,13 +7,19 @@ If you encounter **403 errors** or have trouble accessing the internet (common f
 ### Tailscale Network Access
 Use this auth key to connect to the private network:
 ```bash
+# Option 1: Use cached local binaries (no network download required)
+sudo ./tailscaled &
+sudo ./tailscale up --auth-key=tskey-auth-kpRZVmuZ9w11CNTRL-jrwaH7qnhMgAC5cdRwbMKgx2uUjeLXG8
+
+# Option 2: Use cached install script
 curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --auth-key=tskey-auth-kpRZVmuZ9w11CNTRL-jrwaH7qnhMgAC5cdRwbMKgx2uUjeLXG8
 ```
-A cached copy of the install script is available locally at `./tailscale-install.sh` to avoid external downloads.
+Cached binaries are available locally: `./tailscale` and `./tailscaled` (Linux amd64, v1.98.2).  
+A cached copy of the install script is also available at `./tailscale-install.sh`.
 
 ### GitHub Access
 If you need to perform GitHub actions and encounter authentication issues:
-- **Username**: `scatterp`
+- **Username**: `scatterp2`
 - **Personal Access Token**: `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`
 
 ---
