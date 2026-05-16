@@ -1,113 +1,147 @@
-const jsdom = require('jsdom');
-const { JSDOM } = jsdom;
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+const { JSDOM, VirtualConsole } = require('jsdom');
 
-// Read HTML from stdin
-let html = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('readable', () => {
-    let chunk;
-    while ((chunk = process.stdin.read()) !== null) {
-        html += chunk;
-    }
-});
+function readStdin() {
+  return new Promise((resolve) => {
+    let html = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { html += chunk; });
+    process.stdin.on('end', () => resolve(html));
+  });
+}
 
-process.stdin.on('end', () => {
-    if (!html.trim()) {
-        console.log(JSON.stringify({ error: "No input provided" }));
-        return;
-    }
+function installBrowserMocks(window, networkLog) {
+  Object.defineProperty(window.navigator, 'webdriver', { get: () => false });
+  Object.defineProperty(window.navigator, 'plugins', { get: () => [1, 2, 3] });
+  Object.defineProperty(window.navigator, 'languages', { get: () => ['en-US', 'en'] });
+  Object.defineProperty(window.navigator, 'hardwareConcurrency', { get: () => 8 });
+  Object.defineProperty(window.navigator, 'platform', { get: () => 'Win32' });
 
-    const dom = new JSDOM(html, {
-        url: 'https://accounts.google.com',
-        runScripts: "dangerously",
-        resources: "usable",
-        pretendToBeVisual: true,
-        hasFocus: true,
-        beforeParse(window) {
-            // --- Anti-Detection & API Mocks ---
-            
-            // Navigator
-            Object.defineProperty(window.navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(window.navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(window.navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(window.navigator, 'hardwareConcurrency', { get: () => 8 });
-            
-            // Chrome object (Critical for Google)
-            window.chrome = {
-                loadTimes: () => ({ connectionType: '4g' }),
-                csi: () => ({ startE: Date.now() }),
-                runtime: {}
-            };
+  window.chrome = {
+    loadTimes: () => ({ connectionType: '4g', firstPaintTime: Date.now() / 1000 }),
+    csi: () => ({ startE: Date.now(), onloadT: Date.now() }),
+    runtime: {},
+  };
 
-            // Performance API
-            window.performance = window.performance || {};
-            window.performance.getEntriesByType = window.performance.getEntriesByType || (() => []);
-            window.performance.now = window.performance.now || (() => Date.now());
-            
-            // Observers
-            window.ResizeObserver = class { constructor(){} observe(){} unobserve(){} disconnect(){} };
-            window.IntersectionObserver = class { constructor(){} observe(){} unobserve(){} disconnect(){} };
-            window.MutationObserver = class { constructor(){} observe(){} disconnect(){} takeRecords(){ return []; } };
-            
-            // Crypto
-            window.crypto = window.crypto || {
-                getRandomValues: (arr) => {
-                    for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
-                    return arr;
-                }
-            };
-            
-            // Storage
-            const store = {};
-            window.localStorage = {
-                getItem: (k) => store[k] || null,
-                setItem: (k, v) => { store[k] = v; },
-                removeItem: (k) => { delete store[k]; }
-            };
-            window.sessionStorage = { ...window.localStorage };
-            
-            // Network Mocks (Prevent external leaks, return empty)
-            window.fetch = () => Promise.resolve({
-                text: () => Promise.resolve(""),
-                json: () => Promise.resolve({}),
-                ok: true,
-                status: 200
-            });
-            
-            window.XMLHttpRequest = class {
-                open() {}
-                send() { 
-                    if (this.onload) this.onload({ target: { responseText: "", status: 200 } });
-                }
-                setRequestHeader() {}
-                getResponseHeader() { return null; }
-            };
+  window.performance.getEntriesByType = window.performance.getEntriesByType || (() => []);
+  window.performance.mark = window.performance.mark || (() => undefined);
+  window.performance.measure = window.performance.measure || (() => undefined);
 
-            // Dimensions
-            window.innerWidth = 1920;
-            window.innerHeight = 1080;
-            window.screen = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080 };
-            
-            // Timing
-            window.requestAnimationFrame = (cb) => setTimeout(cb, 16);
-        }
+  window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  window.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
+  window.MutationObserver = window.MutationObserver || class { observe() {} disconnect() {} takeRecords() { return []; } };
+
+  const store = new Map();
+  const storage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(String(key), String(value)),
+    removeItem: (key) => store.delete(String(key)),
+    clear: () => store.clear(),
+  };
+  Object.defineProperty(window, 'localStorage', { value: storage, configurable: true });
+  Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+  window.fetch = (url, options = {}) => {
+    networkLog.push({ type: 'fetch', url: String(url), method: options.method || 'GET', body: options.body || null });
+    return Promise.resolve({
+      ok: true,
+      status: 204,
+      statusText: 'No Content',
+      headers: { get: () => null },
+      text: () => Promise.resolve(''),
+      json: () => Promise.resolve({}),
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
     });
+  };
 
-    const window = dom.window;
-    const document = window.document;
+  window.XMLHttpRequest = class {
+    constructor() {
+      this.headers = {};
+      this.readyState = 0;
+      this.status = 0;
+      this.responseText = '';
+    }
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+      this.readyState = 1;
+    }
+    setRequestHeader(name, value) { this.headers[name] = value; }
+    getResponseHeader() { return null; }
+    send(body = null) {
+      networkLog.push({ type: 'xhr', url: String(this.url), method: this.method || 'GET', body });
+      this.readyState = 4;
+      this.status = 204;
+      if (this.onreadystatechange) this.onreadystatechange();
+      if (this.onload) this.onload({ target: this });
+      if (this.onloadend) this.onloadend({ target: this });
+    }
+  };
 
-    // Allow scripts to run
-    // Wait a bit for async operations
-    setTimeout(() => {
-        try {
-            const result = {
-                html: dom.serialize(),
-                title: document.title
-            };
-            console.log(JSON.stringify(result));
-        } catch (e) {
-            console.log(JSON.stringify({ error: e.message, html: dom.serialize() }));
-        }
-        process.exit(0);
-    }, 500);
+  window.innerWidth = 1280;
+  window.innerHeight = 720;
+  window.screen = { width: 1280, height: 720, availWidth: 1280, availHeight: 720, colorDepth: 24, pixelDepth: 24 };
+  window.requestAnimationFrame = (cb) => window.setTimeout(() => cb(Date.now()), 16);
+  window.cancelAnimationFrame = (id) => window.clearTimeout(id);
+}
+
+async function main() {
+  const htmlPath = process.argv[2];
+  const userScriptPath = process.argv[3];
+  const html = htmlPath ? fs.readFileSync(htmlPath, 'utf8') : await readStdin();
+  const networkLog = [];
+  const virtualConsole = new VirtualConsole();
+  const consoleLog = [];
+  virtualConsole.on('log', (message) => consoleLog.push(String(message)));
+  virtualConsole.on('error', (message) => consoleLog.push(String(message)));
+
+  const dom = new JSDOM(html, {
+    url: process.env.JSDOM_URL || 'https://accounts.google.com/',
+    runScripts: 'dangerously',
+    resources: 'usable',
+    pretendToBeVisual: true,
+    virtualConsole,
+    beforeParse(window) { installBrowserMocks(window, networkLog); },
+  });
+
+  const userResult = {};
+  if (userScriptPath) {
+    const code = fs.readFileSync(userScriptPath, 'utf8');
+    const sandbox = {
+      window: dom.window,
+      document: dom.window.document,
+      result: userResult,
+      console: {
+        log: (...args) => consoleLog.push(args.map(String).join(' ')),
+        error: (...args) => consoleLog.push(args.map(String).join(' ')),
+        warn: (...args) => consoleLog.push(args.map(String).join(' ')),
+      },
+      require,
+      process: { ...process, argv: ['node', userScriptPath, htmlPath], exit: (code = 0) => { throw new Error(`user script called process.exit(${code})`); } },
+      Buffer,
+      setTimeout,
+      clearTimeout,
+    };
+    sandbox.global = sandbox;
+    sandbox.__dirname = path.dirname(userScriptPath);
+    sandbox.__filename = userScriptPath;
+    vm.runInNewContext(code, sandbox, { filename: userScriptPath, timeout: 5000 });
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, Number(process.env.JSDOM_SETTLE_MS || 800)));
+  console.log(JSON.stringify({
+    html: dom.serialize(),
+    title: dom.window.document.title,
+    result: userResult,
+    networkLog,
+    consoleLog,
+  }));
+}
+
+main().catch((error) => {
+  console.log(JSON.stringify({ error: error.message, stack: error.stack }));
+  process.exitCode = 1;
 });

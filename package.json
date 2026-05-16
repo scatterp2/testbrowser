@@ -1,0 +1,13 @@
+{
+  "name": "testbrowser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight text browser prototype with jsdom-backed DOM and JavaScript execution.",
+  "type": "commonjs",
+  "scripts": {
+    "check:js": "node --check run_jsdom.js"
+  },
+  "dependencies": {
+    "jsdom": "^26.1.0"
+  }
+}
