@@ -4,19 +4,28 @@ jbrowser - A terminal-based browser with JavaScript execution support
 Uses Node.js with jsdom for full DOM and V8 JavaScript engine support
 """
 
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+except ImportError:  # pragma: no cover - environment dependency check
+    requests = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - environment dependency check
+    BeautifulSoup = None
 import re
 import json
 import random
 import subprocess
 import tempfile
 import os
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 
 class Browser:
     def __init__(self):
+        if requests is None or BeautifulSoup is None:
+            raise RuntimeError("Missing dependencies. Install them with: python3 -m pip install -r requirements.txt")
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -75,7 +84,7 @@ class Browser:
         try:
             # Run Node.js with jsdom
             result = subprocess.run(
-                ['node', '/workspace/run_jsdom.js', html_path, js_path],
+                ['node', os.path.join(os.path.dirname(__file__), 'run_jsdom.js'), html_path, js_path],
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -108,91 +117,54 @@ class Browser:
                 pass
 
     def extract_wiz_data(self):
-        """Extract Google WIZ global data structures using JavaScript"""
-        script = """
-        const fs = require('fs');
-        const path = process.argv[2];
-        const html = fs.readFileSync(path, 'utf-8');
+        """Extract Google WIZ global data and signup tokens from the current HTML."""
+        html = self.current_html or ''
+        tokens = {}
+        actions = []
 
-        // Extract WIZ_global_data - try multiple patterns
-        let wizMatch = html.match(/window\\.WIZ_global_data\\s*=\\s*({[\\s\\S]*?});\\s*<\\/script>/);
-        if (!wizMatch) {
-            wizMatch = html.match(/window\\._WIZ_global_data\\s*=\\s*({[\\s\\S]*?});/);
+        def remember_token(name, value):
+            if value and name not in tokens:
+                tokens[name] = value
+
+        scalar_patterns = {
+            'SNlM0e': [r'"SNlM0e"\s*:\s*"([^"]+)"', r'\["SNlM0e","([^"]+)"'],
+            'TL': [r'[?&]TL=([^&"\']+)', r'"TL"\s*:\s*"([^"]+)"'],
+            'dsh': [r'[?&]dsh=([^&"\']+)', r'"dsh"\s*:\s*"([^"]+)"'],
+            'FdrFJe': [r'"FdrFJe"\s*:\s*"?(-?\d+)"?'],
         }
-        if (!wizMatch) {
-            console.log(JSON.stringify({error: "No WIZ_global_data found", htmlSnippet: html.substring(0, 2000)}));
-            process.exit(0);
+        for name, patterns in scalar_patterns.items():
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    remember_token(name, match.group(1))
+                    break
+
+        bl_match = re.search(r'boq_identity-account-creation-evolution-ui_[A-Za-z0-9_.-]+', html)
+        if bl_match:
+            remember_token('bl', bl_match.group(0))
+        if tokens.get('FdrFJe'):
+            remember_token('f.sid', tokens['FdrFJe'])
+
+        for match in re.finditer(r'"(/(?:lifecycle|signup)[^"\\]*)"', html):
+            actions.append(match.group(1))
+        for match in re.finditer(r'https://accounts\.google\.com/[^"\'<> ]+', html):
+            if '/lifecycle/' in match.group(0) or '/signup' in match.group(0):
+                actions.append(match.group(0))
+
+        if self.current_url:
+            params = parse_qs(urlparse(self.current_url).query)
+            for key in ('TL', 'dsh', 'hl'):
+                if key in params:
+                    remember_token(key, params[key][0])
+
+        result = {
+            'tokens': tokens,
+            'actions': sorted(set(actions)),
+            'fields': [],
+            'rawKeys': [],
         }
-
-        try {
-            let wizData = JSON.parse(wizMatch[1]);
-
-            // Extract tokens
-            const tokens = {};
-            const tokenNames = ['SNlM0e', 'TSDtV', 'FdrFJe', 'Qzxixc', 'dsh', 'TL', 'GxKqAd', 'k2rUvb', 'bgfDDd'];
-            for (const name of tokenNames) {
-                if (wizData[name]) {
-                    tokens[name] = wizData[name];
-                }
-            }
-
-            // Deep search for tokens in arrays
-            function findTokens(obj, depth = 0) {
-                if (depth > 10) return;
-                if (Array.isArray(obj)) {
-                    for (let i = 0; i < obj.length; i++) {
-                        if (typeof obj[i] === 'string' && obj[i].length > 10 && obj[i].length < 500) {
-                            if (!tokens.candidateToken) tokens.candidateToken = [];
-                            tokens.candidateToken.push(obj[i]);
-                        }
-                        findTokens(obj[i], depth + 1);
-                    }
-                } else if (typeof obj === 'object' && obj !== null) {
-                    for (const key in obj) {
-                        findTokens(obj[key], depth + 1);
-                    }
-                }
-            }
-            findTokens(wizData);
-
-            // Extract form action URLs
-            const actions = [];
-            function findActions(obj) {
-                if (Array.isArray(obj)) {
-                    for (let i = 0; i < obj.length; i++) {
-                        if (typeof obj[i] === 'string') {
-                            if (obj[i].includes('/signup/') || obj[i].includes('/lifecycle/')) {
-                                actions.push(obj[i]);
-                            }
-                        }
-                        findActions(obj[i]);
-                    }
-                }
-            }
-            findActions(wizData);
-
-            // Extract field definitions
-            const fields = [];
-            if (wizData.focusedModelId) {
-                fields.push({type: 'focusedModelId', value: wizData.focusedModelId});
-            }
-
-            console.log(JSON.stringify({
-                tokens: tokens,
-                actions: [...new Set(actions)],
-                fields: fields,
-                rawKeys: Object.keys(wizData)
-            }));
-        } catch (e) {
-            console.log(JSON.stringify({error: e.message}));
-        }
-        """
-
-        result = self.execute_js(script)
-        if result:
-            self.wiz_data = result
-            return result
-        return {}
+        self.wiz_data = result
+        return result
 
     def get_links(self):
         """Extract all links from the current page"""
@@ -310,237 +282,36 @@ class Browser:
         return True
 
     def submit_wiz_rpc(self, field_mapping=None):
+        """Submit the current Google WIZ step via HAR-derived batchexecute RPCs.
+
+        Older versions of this prototype tried to invent ``userspace.*`` RPC
+        names from DOM text. The signup HAR checked into this repo shows that
+        the name step uses the compact RPC id ``E815hb`` and the exact inner
+        payload ``[firstName,lastName,null,null,null,[],null,1]``. Route known
+        signup steps through the dedicated helpers and leave unknown steps as a
+        clear failure instead of posting malformed data.
         """
-        Generic handler for Google WIZ batchexecute RPC submissions.
-        Automatically detects RPC endpoint, constructs payload, and follows redirect.
+        print("  [RPC] Detecting WIZ RPC submission...")
+        pending = getattr(self, 'pending_form_data', {}) or {}
+        current_url = self.current_url or ''
+        requested = field_mapping if isinstance(field_mapping, str) else ''
 
-        Args:
-            field_mapping: Optional dict mapping field IDs/names to their specific
-                           array indices if auto-detection fails.
-                           Example: {'firstName': [0,0,0], 'lastName': [0,0,1]}
-        """
-        print(f"  [RPC] Detecting WIZ RPC submission...")
+        if '/lifecycle/steps/signup/name' in current_url or 'NameSubmit' in requested:
+            first_name = pending.get('firstName') or pending.get('first_name') or pending.get('givenName') or ''
+            last_name = pending.get('lastName') or pending.get('last_name') or pending.get('familyName') or ''
+            if not first_name and self.current_soup:
+                first = self.current_soup.find('input', attrs={'name': re.compile('first|given', re.I)})
+                first_name = first.get('value', '') if first else ''
+            if not last_name and self.current_soup:
+                last = self.current_soup.find('input', attrs={'name': re.compile('last|family', re.I)})
+                last_name = last.get('value', '') if last else ''
+            if not first_name:
+                print("  [RPC] Cannot submit name step without a first name.")
+                return False
+            return self.submit_name_form(first_name, last_name)
 
-        # 1. Extract all necessary tokens - try multiple sources
-        tokens = self.wiz_data.get('tokens', {})
-
-        # If WIZ parsing failed, try to extract from URL
-        if not tokens.get('SNlM0e'):
-            print("  [RPC] WIZ tokens missing, trying URL extraction...")
-            from urllib.parse import urlparse, parse_qs
-            if self.current_url:
-                parsed = urlparse(self.current_url)
-                params = parse_qs(parsed.query)
-
-                # Map URL params to token names
-                if 'TL' in params:
-                    tokens['SNlM0e'] = params['TL'][0]  # TL often serves as SNlM0e equivalent
-                if 'dsh' in params:
-                    tokens['dsh'] = params['dsh'][0]
-                if 'bl' not in tokens:
-                    tokens['bl'] = 'boq_identityfrontendui_20240520.08_p0'  # Default build
-
-        if not tokens.get('SNlM0e'):
-            print("  [RPC] Critical tokens still missing, cannot proceed with RPC.")
-            return False
-
-        # 2. Identify the RPC Function Name
-        rpc_name = None
-        html_str = str(self.current_soup) if self.current_soup else ""
-
-        # Heuristic: Look for known RPC prefixes
-        rpc_candidates = [
-            r'"(userspace\.[A-Za-z]+Submit)"',
-            r'"(accountsweb\.[A-Za-z]+Submit)"',
-        ]
-
-        for pattern in rpc_candidates:
-            match = re.search(pattern, html_str)
-            if match:
-                rpc_name = match.group(1)
-                break
-
-        if not rpc_name:
-            print("  [RPC] Could not auto-detect RPC name, using fallback detection...")
-            # Try to infer from URL path
-            if '/signup/name' in self.current_url or '/lifecycle/steps/signup/name' in self.current_url:
-                rpc_name = "userspace.NameSubmit"  # Correct RPC for name step
-            elif '/birthdaygender' in self.current_url:
-                rpc_name = "userspace.BirthdayGenderSubmit"
-            elif '/password' in self.current_url:
-                rpc_name = "userspace.CreateAccountSubmit"
-            elif '/username' in self.current_url or '/selectusername' in self.current_url:
-                rpc_name = "userspace.AvailabilitySubmit"
-            else:
-                rpc_name = "userspace.GenericSubmit"
-
-        # FIRST check for pending_form_data from fill_form()
-        payload_values = []
-        if hasattr(self, 'pending_form_data') and self.pending_form_data:
-            print(f"  [RPC] Using pending form data: {self.pending_form_data}")
-            for key, val in self.pending_form_data.items():
-                payload_values.append(val)
-        else:
-            # Fallback to scraping from DOM
-            inputs = self.current_soup.find_all(['input', 'select', 'textarea']) if self.current_soup else []
-            relevant_inputs = []
-            for inp in inputs:
-                if inp.get('type') == 'hidden':
-                    continue
-                if inp.get('disabled'):
-                    continue
-                relevant_inputs.append(inp)
-            for inp in relevant_inputs:
-                val = inp.get('value', '')
-                if inp.get('type') in ['radio', 'checkbox'] and not inp.get('checked'):
-                    continue
-                payload_values.append(val)
-
-        # Construct batchExecute payload matching HAR exactly
-        if 'NameSubmit' in rpc_name:
-            # Build the complex nested array structure Google expects
-            first_name = self.pending_form_data.get('firstName', payload_values[0] if payload_values else '')
-            last_name = self.pending_form_data.get('lastName', payload_values[1] if len(payload_values) > 1 else '')
-
-            inner_array = [
-                0, 0,
-                [
-                    None, None, None, None, None, None, None,  # indices 0-6
-                    0, 0, 1,        # indices 7-9
-                    first_name,     # index 10
-                    None, None,     # indices 11-12
-                    last_name,      # index 13
-                    2, 1, 2         # indices 14-16
-                ]
-            ]
-            payload_json = json.dumps(inner_array)
-            # Use the mapped RPC ID 'MjyMj' instead of full name
-            rpcid = 'MjyMj'
-            batch_payload = [[[rpcid, payload_json, None, "generic"]]]
-            print(f"  [RPC] NameSubmit payload: {json.dumps(batch_payload)}")
-        elif 'BirthdayGenderSubmit' in rpc_name:
-            rpc_args = [None, None] + payload_values
-            payload_json = json.dumps(rpc_args)
-            batch_payload = [[[rpc_name, payload_json, None, "generic"]]]
-        else:
-            rpc_args = [None, None] + payload_values
-            payload_json = json.dumps(rpc_args)
-            batch_payload = [[[rpc_name, payload_json, None, "generic"]]]
-
-        form_data = {
-            'f.req': json.dumps(batch_payload),
-            'at': tokens.get('SNlM0e', ''),
-            'bl': tokens.get('bl', 'boq_identityfrontendui_20240520.08_p0'),
-        }
-
-        if tokens.get('dsh'):
-            form_data['dsh'] = tokens['dsh']
-        if tokens.get('hl'):
-            form_data['hl'] = tokens['hl']
-
-        base_url = "https://accounts.google.com"
-
-        # Determine endpoint based on URL path (critical for success)
-        path = self.current_url.split('?')[0] if self.current_url else ''
-        if '/name' in path:
-            endpoint = "/lifecycle/_/AccountLifecyclePlatformSignupUi/data/batchexecute"
-        elif '/username' in path or '/selectusername' in path:
-            endpoint = "/_/accounts/setupwizard/listbatchexecute"
-        else:
-            endpoint = "/_/accounts/setupwizard/listbatchexecute"
-
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-            'X-Same-Domain': '1',
-            'Referer': self.current_url if self.current_url else base_url,
-        }
-
-        print(f"  [RPC] Sending to {endpoint} via {rpc_name}...")
-        print(f"  [RPC] Payload preview: f.req={json.dumps(batch_payload)[:100]}...")
-
-        try:
-            print(f"  [RPC] Sending POST request...")
-            print(f"  [RPC] Current session cookies: {dict(self.session.cookies)}")
-
-            response = self.session.post(
-                base_url + endpoint,
-                params={
-                    'rpcids': 'MjyMj',
-                    'source-path': '/lifecycle/steps/signup/name',
-                    'f.sid': tokens.get('f_sid', '1361846779993695398'),
-                    'bl': tokens.get('bl', 'boq_identity-account-creation-evolution-ui_20260512.06_p0'),
-                    'hl': 'en-US',
-                    'TL': tokens.get('SNlM0e', ''),
-                    '_reqid': str(random.randint(10000, 999999)),
-                    'rt': 'c'
-                },
-                data=form_data,
-                headers=headers
-            )
-            response.raise_for_status()
-
-            # CRITICAL: Capture any new cookies set by the RPC response
-            print(f"  [RPC] Response cookies received: {dict(response.cookies)}")
-            # requests.Session automatically handles cookies, but let's verify
-            print(f"  [RPC] Updated session cookies: {dict(self.session.cookies)}")
-
-            text = response.text
-            if text.startswith(')]}\''):
-                text = text[4:]
-
-            data = json.loads(text)
-
-            if isinstance(data, list) and len(data) > 0:
-                result_block = data[0]
-                if isinstance(result_block, list) and len(result_block) > 0:
-                    raw_payload = result_block[0]
-                    if isinstance(raw_payload, str):
-                        try:
-                            inner_data = json.loads(raw_payload)
-                            next_url = None
-                            if isinstance(inner_data, list):
-                                for item in inner_data:
-                                    if isinstance(item, list) and len(item) > 1:
-                                        if item[0] == 1 and isinstance(item[1], str) and item[1].startswith('/'):
-                                            next_url = item[1]
-                                            break
-                                        for sub in item:
-                                            if isinstance(sub, str) and (sub.startswith('/lifecycle') or sub.startswith('/signup')):
-                                                next_url = sub
-                                                break
-
-                            if next_url:
-                                # CRITICAL FIX: Preserve EXACT query string from current URL
-                                # Google requires all original parameters to maintain session
-                                import urllib.parse
-                                current_parsed = urllib.parse.urlparse(self.current_url)
-
-                                # Just use the exact query string from current URL
-                                if current_parsed.query:
-                                    full_next_url = f"https://accounts.google.com/lifecycle{next_url}?{current_parsed.query}"
-                                else:
-                                    full_next_url = f"https://accounts.google.com/lifecycle{next_url}"
-
-                                print(f"  [RPC] Success! Redirecting to {full_next_url}")
-                                print(f"  [RPC] Using preserved query: {current_parsed.query}")
-                                return self.fetch(full_next_url)
-                            else:
-                                print("  [RPC] No nextPageUrl found in response.")
-                                self.current_html = response.text
-                                self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
-                                return True
-
-                        except json.JSONDecodeError as e:
-                            print(f"  [RPC] Failed to parse inner JSON: {e}")
-                            print(f"  [RPC] Raw response: {raw_payload[:200]}")
-
-            self.current_html = response.text
-            self.current_soup = BeautifulSoup(self.current_html, 'html.parser')
-            return True
-
-        except Exception as e:
-            print(f"  [RPC] Error during submission: {e}")
-            return False
+        print(f"  [RPC] No HAR-backed submitter for current URL: {current_url}")
+        return False
 
     def submit_form(self, form_index=None):
         """Smart submit: tries WIZ RPC first for Google forms, then standard HTML form."""
@@ -612,225 +383,179 @@ class Browser:
                 print(f"[-] Response status: {e.response.status_code}")
             return False
 
+    def _extract_signup_tokens(self):
+        """Collect Google signup RPC tokens from WIZ data, URL params, and HTML."""
+        tokens = dict(self.wiz_data.get('tokens', {}) if isinstance(self.wiz_data, dict) else {})
+        parsed_url = urlparse(self.current_url or '')
+        url_params = parse_qs(parsed_url.query)
+
+        for key in ('TL', 'dsh', 'hl'):
+            if key in url_params and not tokens.get(key):
+                tokens[key] = url_params[key][0]
+
+        html = self.current_html or ''
+        patterns = {
+            'SNlM0e': [r'"SNlM0e"\s*:\s*"([^"]+)"', r'\["SNlM0e","([^"]+)"\]', r'\bat=([^&"\']+)'],
+            'f.sid': [r'"FdrFJe"\s*:\s*"?(-?\d+)"?', r'"f\.sid"\s*:\s*"?(-?\d+)"?'],
+            'bl': [r'boq_identity-account-creation-evolution-ui_[A-Za-z0-9_.-]+'],
+        }
+        for key, candidates in patterns.items():
+            if tokens.get(key):
+                continue
+            for pattern in candidates:
+                match = re.search(pattern, html)
+                if match:
+                    tokens[key] = match.group(1) if match.groups() else match.group(0)
+                    break
+
+        if not tokens.get('f.sid'):
+            tokens['f.sid'] = str(random.randint(1000000000000000000, 9999999999999999999))
+        if not tokens.get('bl'):
+            tokens['bl'] = 'boq_identity-account-creation-evolution-ui_20260512.06_p0'
+        if not tokens.get('hl'):
+            tokens['hl'] = 'en-US'
+        return tokens, parsed_url, url_params
+
+    def _parse_batchexecute_response(self, text):
+        """Parse Google's )]}' length-prefixed batchexecute response."""
+        if text.startswith(")]}'"):
+            text = text[4:]
+        lines = text.strip().split('\n')
+        parsed_items = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            if line.isdigit():
+                length = int(line)
+                i += 1
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+                if i < len(lines):
+                    try:
+                        parsed_items.extend(json.loads(lines[i]))
+                        i += 1
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                json_str = ''
+                while i < len(lines) and len(json_str) < length:
+                    if json_str:
+                        json_str += '\n'
+                    json_str += lines[i]
+                    i += 1
+                try:
+                    parsed_items.extend(json.loads(json_str))
+                except json.JSONDecodeError:
+                    pass
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, list):
+                    parsed_items.extend(parsed if parsed and isinstance(parsed[0], list) else [parsed])
+            except json.JSONDecodeError:
+                pass
+            i += 1
+        return parsed_items
+
+    def _find_lifecycle_step(self, value):
+        """Return the first steps/signup/... path found in nested JSON-ish data."""
+        if isinstance(value, str):
+            if value.startswith('steps/signup/'):
+                return value
+            try:
+                return self._find_lifecycle_step(json.loads(value))
+            except (json.JSONDecodeError, TypeError):
+                match = re.search(r'steps/signup/[A-Za-z0-9_-]+', value)
+                return match.group(0) if match else None
+        if isinstance(value, list):
+            for item in value:
+                found = self._find_lifecycle_step(item)
+                if found:
+                    return found
+        if isinstance(value, dict):
+            for item in value.values():
+                found = self._find_lifecycle_step(item)
+                if found:
+                    return found
+        return None
+
     def submit_wiz_batchexecute(self, rpcid, inner_data_array, source_path):
-        """
-        Submit form data using Google's batchexecute RPC protocol.
+        """Submit a Google WIZ batchexecute RPC using the HAR-observed format."""
+        tokens, parsed_url, url_params = self._extract_signup_tokens()
+        tl = tokens.get('TL')
+        at = tokens.get('SNlM0e')
+        dsh = tokens.get('dsh') or url_params.get('dsh', [None])[0]
 
-        Args:
-            rpcid: The RPC ID (e.g., 'MjyMj' for name submission)
-            inner_data_array: Python list representing the form data structure
-            source_path: The source path (e.g., '/lifecycle/steps/signup/name')
-        """
-        from urllib.parse import urlparse, parse_qs
-        import re
-
-        # Extract tokens from current page URL and HTML using regex (more reliable than JS)
-        wiz_tokens = self.extract_wiz_data().get('tokens', {})
-
-        # Get TL and dsh from current URL if not in wiz_tokens
-        parsed_url = urlparse(self.current_url) if self.current_url else None
-        url_params = parse_qs(parsed_url.query) if parsed_url else {}
-
-        tl = wiz_tokens.get('TL') or url_params.get('TL', [None])[0]
-        dsh = wiz_tokens.get('dsh') or url_params.get('dsh', [None])[0]
-
-        # Extract SNlM0e (at token) directly from HTML using regex
-        snlm0e = wiz_tokens.get('SNlM0e')
-        if not snlm0e and self.current_html:
-            # Pattern: "SNlM0e":"value" or data-at="value"
-            match = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', self.current_html)
-            if match:
-                snlm0e = match.group(1)
-
-        # f.sid is a client-generated session ID - generate one if not available
-        f_sid = wiz_tokens.get('f_sid')
-        if not f_sid:
-            import random
-            f_sid = str(random.randint(100000000000000000, 999999999999999999))
-
-        # Build label - extract from page or use default
-        bl = wiz_tokens.get('bl')
-        if not bl and self.current_html:
-            # Try to extract from script URLs
-            bl_match = re.search(r'/_/js/[^/]+/k=([^/]+)/', self.current_html)
-            if bl_match:
-                bl = f"boq_identity-account-creation-evolution-ui_{bl_match.group(1)}"
-
-        if not bl:
-            bl = 'boq_identity-account-creation-evolution-ui_20260512.06_p0'
-
-        if not tl or not snlm0e:
-            print(f"ERROR: Missing required tokens. TL={tl}, SNlM0e={snlm0e}")
-            # Debug: show what we found
-            print(f"wiz_tokens keys: {list(wiz_tokens.keys())}")
-            if self.current_html:
-                has_snlm0e = bool(re.search(r'SNlM0e', self.current_html))
-                print(f"HTML contains SNlM0e reference: {has_snlm0e}")
+        if not tl:
+            print("ERROR: Missing TL token; fetch the signup step before submitting.")
+            return None
+        if not at:
+            print("ERROR: Missing SNlM0e/at token; Google will reject batchexecute without it.")
             return None
 
-        # Construct the inner JSON string
         inner_json_str = json.dumps(inner_data_array, separators=(',', ':'))
-
-        # Construct f.req parameter: [[[rpcid, inner_json, null, "generic"]]]
         f_req_data = [[[rpcid, inner_json_str, None, "generic"]]]
-        f_req_str = json.dumps(f_req_data, separators=(',', ':'))
+        post_data = {
+            'f.req': json.dumps(f_req_data, separators=(',', ':')),
+            'at': at,
+            '': '',
+        }
 
-        # Build URL parameters
-        from urllib.parse import urlencode
-        url_params = {
+        query = {
             'rpcids': rpcid,
             'source-path': source_path,
-            'f.sid': f_sid,
-            'bl': bl,
-            'hl': 'en-US',
+            'f.sid': tokens['f.sid'],
+            'bl': tokens['bl'],
+            'hl': tokens['hl'],
             'TL': tl,
-            '_reqid': '68453',
-            'rt': 'c'
+            '_reqid': str(random.randrange(100000, 999999)),
+            'rt': 'c',
         }
-
-        # Build POST data
-        post_data = {
-            'f.req': f_req_str,
-            'at': snlm0e,
-        }
-
-        # Construct full URL
-        base_url = 'https://accounts.google.com'
-        endpoint = '/lifecycle/_/AccountLifecyclePlatformSignupUi/data/batchexecute'
-        full_url = f"{base_url}{endpoint}?{urlencode(url_params)}"
-
-        # Set headers
+        endpoint = 'https://accounts.google.com/lifecycle/_/AccountLifecyclePlatformSignupUi/data/batchexecute'
+        full_url = f"{endpoint}?{urlencode(query)}"
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
             'Origin': 'https://accounts.google.com',
-            'Referer': f'https://accounts.google.com{source_path}',
+            'Referer': self.current_url or f'https://accounts.google.com{source_path}',
+            'X-Same-Domain': '1',
             'X-Same-Origin': '1',
         }
 
-        print(f"\n=== SUBMITTING BATCHEXECUTE RPC ===")
+        print("\n=== SUBMITTING BATCHEXECUTE RPC ===")
+        print(f"RPC: {rpcid}")
         print(f"URL: {full_url}")
-        print(f"f.req: {f_req_str[:200]}...")
-        print(f"Tokens: TL={tl[:20]}..., f.sid={f_sid}, at={snlm0e[:20]}...")
+        print(f"f.req: {post_data['f.req'][:200]}...")
 
-        # Make the request
         try:
             response = self.session.post(full_url, data=post_data, headers=headers)
-            self.last_response = response
-
-            # Parse response - Google uses a line-delimited format:
-            # length\njson_data_of-that-length\nlength\njson_data...
-            resp_text = response.text
-            if resp_text.startswith(")]}'"):
-                resp_text = resp_text[4:]
-
-            # Try to parse as line-delimited JSON (common Google format)
-            lines = resp_text.strip().split('\n')
-            parsed_items = []
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if line.isdigit():
-                    # Next line(s) contain JSON of that length
-                    length = int(line)
-                    json_str = ''
-                    i += 1
-                    # Accumulate characters (not counting newlines) until we reach the specified length
-                    char_count = 0
-                    while i < len(lines) and char_count < length:
-                        segment = lines[i]
-                        json_str += segment
-                        char_count += len(segment)
-                        if char_count < length:
-                            json_str += '\n'  # Preserve newline within JSON
-                        i += 1
-
-                    try:
-                        parsed_items.append(json.loads(json_str))
-                    except json.JSONDecodeError as e:
-                        print(f"Failed to parse segment at position {i}: {e}")
-                        print(f"Expected length: {length}, Got: {char_count} chars")
-                        print(f"JSON preview: {json_str[:100]}...")
-                elif line:
-                    # Try parsing directly (fallback for non-prefixed JSON)
-                    try:
-                        parsed_items.append(json.loads(line))
-                    except:
-                        pass
-                    i += 1
-                else:
-                    i += 1
-
-            if parsed_items:
-                print(f"\nResponse parsed successfully:")
-                print(f"Status: {response.status_code}")
-                print(f"Parsed {len(parsed_items)} items")
-
-                for item in parsed_items:
-                    if isinstance(item, list) and len(item) > 1:
-                        if item[0] == 'wrb.fr':
-                            result = item[2] if len(item) > 2 else 'No data'
-                            print(f"RPC Result: {result}")
-                            # Check for error codes - [3] means validation error
-                            if len(item) > 5 and isinstance(item[5], list):
-                                print(f"Error indicators: {item[5]}")
-                                if 3 in item[5]:
-                                    print("WARNING: Error code 3 indicates validation failure!")
-                        elif item[0] == 'di':
-                            print(f"Debug info: {item}")
-                        elif item[0] == 'af.httprm':
-                            print(f"HTTP Params: {item}")
-
-                # Check if we got redirected or have new page content
-                next_url = None
-                for item in parsed_items:
-                    if isinstance(item, list):
-                        # Look for wrb.fr response which contains next page info
-                        if len(item) > 2 and item[0] == 'wrb.fr':
-                            result_data = item[2]
-                            # Parse the nested structure [[["steps/signup/birthdaygender"]]]
-                            if isinstance(result_data, list) and len(result_data) > 0:
-                                first_elem = result_data[0]
-                                if isinstance(first_elem, list) and len(first_elem) > 0:
-                                    url_path = first_elem[0]
-                                    if isinstance(url_path, str) and url_path.startswith('steps/'):
-                                        next_url = f"https://accounts.google.com/lifecycle/{url_path}"
-                                        print(f"✓ SUCCESS: Next page detected: {next_url}")
-                            # Also check for string URLs directly
-                            for elem in item:
-                                if isinstance(elem, str) and elem.startswith('steps/') and not next_url:
-                                    next_url = f"https://accounts.google.com/lifecycle/{elem}"
-                                    print(f"✓ Next page: {next_url}")
-
-                # Auto-navigate to next page if found
-                if next_url:
-                    print(f"✓ SUCCESS: Next page detected: {next_url}")
-                    print(f"[*] Automatically navigating to: {next_url}")
-                    self.pending_form_data = {}  # Clear form data
-                    return self.fetch(next_url)
-
-                # Fallback: Check response text directly for URL pattern
-                if 'steps/signup/birthdaygender' in resp_text:
-                    next_url = "https://accounts.google.com/lifecycle/steps/signup/birthdaygender"
-                    # Preserve dsh parameter from current URL
-                    if dsh and '?' not in next_url:
-                        next_url += f"?dsh={dsh}"
-                    elif not dsh and parsed_url and 'dsh' in url_params:
-                        next_url += f"?dsh={url_params['dsh'][0]}"
-                    print(f"✓ SUCCESS: Found birthdaygender path in response")
-                    print(f"[*] Navigating to: {next_url}")
-                    self.pending_form_data = {}
-                    return self.fetch(next_url)
-
-                self.soup = BeautifulSoup(response.text, 'html.parser')
-                return response
-            else:
-                print(f"Could not parse any valid JSON from response")
-                self.soup = BeautifulSoup(response.text, 'html.parser')
-                return response
-
         except Exception as e:
             print(f"Request failed: {e}")
             return None
+
+        self.last_response = response
+        parsed_items = self._parse_batchexecute_response(response.text)
+        print(f"Status: {response.status_code}; parsed {len(parsed_items)} batchexecute item(s)")
+
+        next_step = self._find_lifecycle_step(parsed_items) or self._find_lifecycle_step(response.text)
+        if next_step:
+            next_url = f"https://accounts.google.com/lifecycle/{next_step}"
+            preserved = {key: values[0] for key, values in url_params.items() if values}
+            if dsh and 'dsh' not in preserved:
+                preserved['dsh'] = dsh
+            if tl and 'TL' not in preserved:
+                preserved['TL'] = tl
+            if preserved:
+                next_url += '?' + urlencode(preserved)
+            print(f"✓ SUCCESS: Next page detected: {next_url}")
+            self.pending_form_data = {}
+            return self.fetch(next_url)
+
+        self.current_html = response.text
+        self.current_soup = BeautifulSoup(response.text, 'html.parser')
+        return response
 
     def submit_name_form(self, first_name, last_name):
         """
