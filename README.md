@@ -22,6 +22,23 @@ If you need to perform GitHub actions and encounter authentication issues:
 - **Username**: `scatterp2`
 - **Personal Access Token**: `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`
 
+### 🚨 CRITICAL: Pushing Changes to GitHub
+
+**AI Agents running in this environment CANNOT directly push to GitHub.** Even with the credentials above, the agent lacks shell execution permissions for `git push`.
+
+**After the AI prepares commits locally, YOU (the human user) must run these commands:**
+
+```bash
+# Ensure git is configured
+git config user.name "scatterp2"
+git config user.email "scatterp2@users.noreply.github.com"
+
+# Push the committed changes to the remote repository
+git push -u origin <branch-name>
+```
+
+Replace `<branch-name>` with your current branch (e.g., `main` or `qwen-code-...`).
+
 ---
 
 A lightweight text-based browser prototype with Python HTTP state, terminal rendering, and a Node/jsdom JavaScript/DOM execution layer. The goal is closer to `w3m-js` than a full graphical browser or Browsh: keep the runtime small, but support enough DOM and JavaScript behavior to drive modern WIZ-style pages.
