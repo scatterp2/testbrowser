@@ -1,62 +1,69 @@
 # testbrowser
 
-bellard.org/quickjs/binary_releases/quickjs-linux-i686-2024-01-13.zip 
+A lightweight text-based browser prototype with Python HTTP state, terminal rendering, and a Node/jsdom JavaScript/DOM execution layer. The goal is closer to `w3m-js` than a graphical browser or Browsh: keep the runtime small, but support enough DOM, events, cookies, and JavaScript-driven network behavior to drive modern pages.
 
-steps visit https://accounts.google.com/signin
-click create an account
-click personal
-click next
-enter first and last name (steven boils) 
-click next..
-return the data on the next page
+## Browser approach
 
-Project Context: Lightweight Text-Based Browser with V8/jsdom
-Goal: Create a pure Python/Node.js terminal browser that can execute complex JavaScript (specifically Google's WIZ framework) to automate the Google Account signup flow up to Page 3 (Username Selection), without using heavy tools like Selenium or Playwright.
-Current State:
-Core Architecture:
-Backend: Python requests + BeautifulSoup4 for HTTP and static parsing.
-JS Engine: Node.js running a custom script (run_jsdom.js) using jsdom to simulate a DOM.
-Execution Flow: Python sends HTML to Node -> Node injects mocks, runs JS, serializes modified DOM -> Python parses result.
-Key Achievements:
-✅ Navigation: Successfully navigates from Google Home -> Sign In -> "Create Account" click.
-✅ JS Execution: Successfully executes document.write, dynamic DOM creation, and Google's initial WIZ data parsing.
-✅ Anti-Detection Spoofing: Implemented mocks for navigator.webdriver=false, window.chrome, performance.getEntriesByType(), ResizeObserver, and realistic user-agent strings.
-✅ Text Rendering: Can render the final DOM state (including JS-generated content) as a text tree in the terminal.
-⚠️ The Blocker: The flow stops at Page 2 (Name Input). Clicking "Next" fails (400/405 errors) because Google requires specific RPC-style form submission with obfuscated field names and dynamic tokens that standard HTML form parsing misses.
-The Specific Problem to Solve:
-Google's Page 2 form does not use standard <form action="...">.
-The "Next" button triggers a JavaScript function that:
-Reads obfuscated field IDs (e.g., rZHESd instead of firstName) from window.WIZ_global_data.
-Constructs a specific payload with tokens (SNlM0e, dsh, et).
-Sends an XHR/Fetch request to a dynamic endpoint (e.g., /signup/v1/webname).
-Current Failure: The browser attempts a standard POST to the current URL, which Google rejects.
-Required Implementation Details (The "Secret Sauce"):
-File: run_jsdom.js
-Must use jsdom with { runScripts: "dangerously", resources: "usable" }.
-Critical Mocks:
-navigator.webdriver = false
-window.chrome = { loadTimes: ..., csi: ... }
-performance.getEntriesByType() must return a valid array (not undefined).
-XMLHttpRequest and fetch must be mocked to log requests or route them through Python if needed (though for now, just preventing crashes is key).
-ResizeObserver, IntersectionObserver, MutationObserver must be no-op classes.
-Output: Must return the serialized HTML after all async tasks (setTimeout/Promises) settle.
-File: browser.py
-Method fill_and_submit_wiz_form(page_html, field_values):
-Instead of looking for <form>, it must execute a JS snippet via Node to parse window.WIZ_global_data.
-Parsing Logic: Look for the nested array structure in WIZ_global_data that contains the RPC endpoint URL and the mapping of logical names (firstName) to obfuscated keys (rZHESd).
-Token Extraction: Extract SNlM0e (auth token), dsh (data session hash), and et (execution token) from the global data or hidden inputs.
-Submission: Construct a POST request to the extracted RPC endpoint with Content-Type: application/x-www-form-urlencoded (or sometimes JSON depending on the specific WIZ version), including the obfuscated keys and tokens.
-File: test_flow.py
-Sequence:
-GET Sign-in URL.
-Find "Create account" link/button (handle jsaction clicks).
-GET Signup Page 1 (Name).
-Call fill_and_submit_wiz_form with {"firstName": "steve", "lastName": "boils"}.
-Check response: If successful, it redirects/returns HTML for Page 2 (Username).
-Render Page 2.
-Dependencies:
-Python: requests, beautifulsoup4, lxml.
-Node.js: jsdom (installed via npm install jsdom).
-System: node and python3 must be in PATH.
-Instruction to New AI:
-"Recreate the files browser.py, run_jsdom.js, and test_flow.py based on the architecture above. Focus heavily on the fill_and_submit_wiz_form logic in browser.py to parse WIZ_global_data for obfuscated keys and tokens, ensuring run_jsdom.js has all necessary anti-detection mocks so Google's JS doesn't crash or refuse to run. The goal is to successfully POST the name data and receive the Username Selection page HTML.
+The browser should not be a Google-signup protocol script. Google signup is only the current stress test for DOM + JavaScript behavior. The submit path now prefers a browser-like interaction loop:
+
+1. Load the current HTML into jsdom using the real current URL.
+2. Fill controls by semantic labels, names, placeholders, autocomplete, and ARIA text.
+3. Click the likely **Next**, **Continue**, **Submit**, **Verify**, or requested button.
+4. Capture any `fetch`/`XMLHttpRequest` the page JavaScript emits.
+5. Replay that captured request through the Python `requests.Session` so cookies and redirects remain browser-owned.
+
+This keeps WIZ RPC IDs and payload shapes data-driven by the live page JavaScript instead of hard-coded from a HAR.
+
+## Google signup test case
+
+The proving flow is Google account signup, but it is treated as an end-to-end browser scenario:
+
+1. Visit `https://accounts.google.com/signin`.
+2. Click **Create account**.
+3. Progress through all recognized, completable steps (name, birthday/gender, username, password, terms, etc.).
+4. If a phone step appears, submit one random test phone number and then stop at the expected phone/SMS verification block.
+5. If a locale or experiment skips phone collection, continue until the next unknown or non-automatable challenge.
+
+The checked-in HAR may be useful while developing, but it is not part of the browser contract and tests should not require it. New coverage should prefer compact synthetic fixtures that verify generic browser behavior and dynamic branches.
+
+## Important files
+
+- `browser.py` — Python session/state, DOM parsing, text rendering, semantic signup-step classification, JS-driven form interaction, and replay of captured JS network requests.
+- `run_jsdom.js` — jsdom runner with browser API mocks (`navigator.webdriver=false`, `window.chrome`, observers, storage, `fetch`, and `XMLHttpRequest` logging).
+- `test_flow.py` — exploratory live-flow script.
+- `test_browser.py` — offline unit tests for dynamic signup-step classification and generic, non-HAR-driven interaction script generation.
+
+## Setup
+
+Python dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+Node dependency from the supplied tarball, when available:
+
+```bash
+wget -O jsdom-29.1.1.tgz https://github.com/scatterp2/testbrowser/raw/8eb8f60db2d61b5b35108bbbd063162df93a9953/jsdom-29.1.1.tgz
+npm install ./jsdom-29.1.1.tgz
+```
+
+If the tarball is unavailable in your environment, use the normal npm dependency path:
+
+```bash
+npm install
+```
+
+## Checks
+
+```bash
+python3 -m unittest test_browser.py
+python3 -m py_compile browser.py test_flow.py test_browser.py
+node --check run_jsdom.js
+git diff --check
+```
+
+## Notes
+
+- `run_jsdom.js` intentionally mocks browser-side network APIs. It records attempted `fetch`/XHR calls in `networkLog`; Python decides whether to replay those requests through the browser session.
+- PyV8 is worth tracking as a future embedded-V8 backend, but this code path stays on Node/jsdom for now because jsdom supplies the DOM/event surface needed by the current browser tests.
