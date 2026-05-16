@@ -8,6 +8,6 @@
     "check:js": "node --check run_jsdom.js"
   },
   "dependencies": {
-    "jsdom": "^26.1.0"
+    "jsdom": "https://github.com/scatterp2/testbrowser/raw/8eb8f60db2d61b5b35108bbbd063162df93a9953/jsdom-29.1.1.tgz"
   }
 }
