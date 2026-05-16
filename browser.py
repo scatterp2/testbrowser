@@ -83,11 +83,15 @@ class Browser:
 
         try:
             # Run Node.js with jsdom
+            env = os.environ.copy()
+            if self.current_url:
+                env['JSDOM_URL'] = self.current_url
             result = subprocess.run(
                 ['node', os.path.join(os.path.dirname(__file__), 'run_jsdom.js'), html_path, js_path],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=env
             )
 
             if result.returncode != 0:
@@ -842,6 +846,96 @@ class Browser:
         print("[-] Could not determine action from jsaction")
         return False
 
+    def classify_signup_step(self):
+        """Classify the visible signup step from URL, inputs, labels, and text."""
+        html = (self.current_html or '').lower()
+        url = (self.current_url or '').lower()
+        text = self.current_soup.get_text(' ', strip=True).lower() if self.current_soup else html
+        fields = ' '.join(
+            ' '.join(filter(None, [inp.get('name'), inp.get('id'), inp.get('type'), inp.get('autocomplete'), inp.get('aria-label'), inp.get('placeholder')]))
+            for inp in (self.current_soup.find_all(['input', 'select', 'textarea']) if self.current_soup else [])
+        ).lower()
+        haystack = f"{url} {text} {fields}"
+        if any(token in haystack for token in ('5 gb', '5gb', 'storage', 'add phone later', 'skip')):
+            return 'phone_optional'
+        if any(token in haystack for token in ('verify your phone', 'phone number', 'mobile number', 'sms', 'text message')):
+            return 'phone'
+        if any(token in haystack for token in ('birthday', 'birth day', 'gender', 'month', 'year')):
+            return 'birthdaygender'
+        if any(token in haystack for token in ('choose your gmail', 'username', 'create a gmail', 'email address')):
+            return 'username'
+        if any(token in haystack for token in ('password', 'confirm')):
+            return 'password'
+        if any(token in haystack for token in ('first name', 'last name', 'given name', 'family name')):
+            return 'name'
+        if any(token in haystack for token in ('privacy and terms', 'i agree')):
+            return 'terms'
+        return 'unknown'
+
+    def default_signup_data(self):
+        """Generate non-secret test values for signup automation."""
+        suffix = str(random.randrange(100000, 999999))
+        return {
+            'firstName': 'Test',
+            'lastName': f'Browser{suffix}',
+            'day': '1',
+            'month': 'January',
+            'year': '1990',
+            'gender': 'Rather not say',
+            'username': f'testbrowser{suffix}',
+            'password': f'TestBrowser!{suffix}',
+            'phoneNumber': f'+1555{random.randrange(1000000, 9999999)}',
+        }
+
+    def fill_current_signup_step(self, data=None):
+        """Fill fields appropriate for the currently visible signup step."""
+        all_data = self.default_signup_data()
+        if data:
+            all_data.update(data)
+        step = self.classify_signup_step()
+        if step == 'name':
+            fields = {key: all_data[key] for key in ('firstName', 'lastName')}
+        elif step == 'birthdaygender':
+            fields = {key: all_data[key] for key in ('day', 'month', 'year', 'gender')}
+        elif step == 'username':
+            fields = {'username': all_data['username']}
+        elif step == 'password':
+            fields = {'password': all_data['password'], 'confirm': all_data['password']}
+        elif step in ('phone', 'phone_optional'):
+            fields = {'phoneNumber': all_data['phoneNumber']}
+        elif step == 'terms':
+            fields = {}
+        else:
+            return step, False
+        self.pending_form_data = fields
+        return step, True
+
+    def drive_signup_until_blocked(self, max_steps=12, data=None):
+        """Drive completable signup pages until a verification/blocking step remains.
+
+        If a locale or experiment skips phone collection it keeps going; if phone
+        is required, it submits one random test number and reports the expected
+        verification block instead of pretending that an SMS challenge can be
+        completed.
+        """
+        history = []
+        submitted_phone = False
+        for _ in range(max_steps):
+            step, can_fill = self.fill_current_signup_step(data)
+            history.append(step)
+            if step == 'unknown' or not can_fill:
+                return {'status': 'blocked', 'reason': 'unknown_step', 'history': history, 'url': self.current_url}
+            ok = self.submit_js_interactive_form(getattr(self, 'pending_form_data', {}), submit_text='next')
+            if not ok:
+                reason = 'phone_verification' if step in ('phone', 'phone_optional') else 'submission_failed'
+                return {'status': 'blocked', 'reason': reason, 'history': history, 'url': self.current_url}
+            new_step = self.classify_signup_step()
+            if step in ('phone', 'phone_optional'):
+                if submitted_phone or new_step in ('phone', 'phone_optional'):
+                    return {'status': 'blocked', 'reason': 'phone_verification', 'history': history + [new_step], 'url': self.current_url}
+                submitted_phone = True
+        return {'status': 'blocked', 'reason': 'max_steps', 'history': history, 'url': self.current_url}
+
     def render_page(self):
         """Render the current page content"""
         if not self.current_soup:
@@ -884,43 +978,22 @@ class Browser:
 
 
 def main():
-    """Main entry point for testing"""
+    """Main entry point for exploratory live testing."""
     browser = Browser()
 
-    # Test Google signup flow
-    print("=== Testing Google Signup Flow ===\n")
+    print("=== Testing Google Signup Browser Flow ===\n")
 
-    # Step 1: Go to sign-in page
-    browser.fetch("https://accounts.google.com/signin")
+    if not browser.fetch("https://accounts.google.com/signin"):
+        return
     browser.render_page()
 
-    # Step 2: Click "Create account"
     if browser.click_button("Create account"):
         browser.render_page()
 
-    # Step 3: Fill in name and submit using HAR-matched RPC
-    if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
-        print("[*] Submitting name form via HAR-matched RPC...")
-        response = browser.submit_name_form('steve', 'boils')
-        if response:
-            browser.render_page()
-            if 'username' in browser.current_url.lower() or 'name' not in browser.current_url.lower():
-                print("\n✓ SUCCESS: Moved past name page!")
-                print(f"Current URL: {browser.current_url}")
-            else:
-                print("\n✗ Still on name page")
-                print(f"Current URL: {browser.current_url}")
-        else:
-            print("[!] submit_name_form returned None/False")
-            if browser.fill_form(0, {'firstName': 'steve', 'lastName': 'boils'}):
-                if browser.submit_form(0):
-                    browser.render_page()
-
-    # Check if we reached page 3 (username selection)
-    if 'username' in browser.current_html.lower():
-        print("\n✓ SUCCESS: Reached username selection page!")
-    else:
-        print("\n✗ Did not reach username page yet")
+    result = browser.drive_signup_until_blocked()
+    browser.render_page()
+    print("\n=== Signup driver result ===")
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

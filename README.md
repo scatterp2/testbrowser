@@ -42,14 +42,18 @@ Python dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-Node dependency:
+Node dependency from the supplied tarball, when available:
 
 ```bash
+wget -O jsdom-29.1.1.tgz https://github.com/scatterp2/testbrowser/raw/8eb8f60db2d61b5b35108bbbd063162df93a9953/jsdom-29.1.1.tgz
 npm install ./jsdom-29.1.1.tgz
-npm install
 ```
 
-The `package.json` dependency is pinned to the same jsdom 29.1.1 tarball so a plain `npm install` also installs the project against that browser runtime.
+If the tarball is unavailable in your environment, use the normal npm dependency path:
+
+```bash
+npm install
+```
 
 ## Checks
 
